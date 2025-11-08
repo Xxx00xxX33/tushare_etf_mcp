@@ -4,7 +4,7 @@
 # server.  It includes metadata such as the name, version and description of
 # the server, build instructions, and the start command.  See the official
 # documentation for details:
-# https://smithery.ai/docs/build/project-config/smithery.yaml
+# https://streamable-http.ai/docs/build/project-config/smithery.yaml
 
 name: "@Xxx00xxX33/etf_mcp"
 version: "0.1.0"
@@ -31,7 +31,7 @@ build:
 # server uses the streamable HTTP transport.  The `configSchema` defines
 # configuration options that users may provide when deploying the server.
 startCommand:
-  type: http
+  type: streamable-http
   configSchema:
     type: object
     properties:
