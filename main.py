@@ -280,3 +280,255 @@ def df_list_to_rows(df: "DataFrame", columns: List[str]) -> List[dict]:
     if not available_cols:
         return []
     return df[available_cols].to_dict(orient="records")
+# MCP code start
+from fastapi import Request
+
+class Tool:
+    """Simple container for MCP tool metadata and execution logic."""
+
+    def __init__(self, name: str, description: str, input_schema: dict, run: Callable[..., asyncio.Future]):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+        self.run = run
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.input_schema,
+        }
+
+
+async def tool_list_etfs(*, market: str = "E") -> List[dict]:
+    pro = get_pro()
+    try:
+        df: DataFrame = pro.fund_basic(market=market)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
+    return df_to_dicts(df)
+
+async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[dict]:
+    pro = get_pro()
+    def normalise(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.replace("-", "")
+    start = normalise(start_date)
+    end = normalise(end_date)
+    try:
+        df: DataFrame = pro.fund_nav(ts_code=ts_code, start_date=start, end_date=end)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
+    return df_to_dicts(df)
+
+async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[dict]:
+    pro = get_pro()
+    def normalise(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.replace("-", "")
+    start = normalise(start_date)
+    end = normalise(end_date)
+    try:
+        df: DataFrame = pro.fund_portfolio(ts_code=ts_code, start_date=start, end_date=end)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
+    return df_to_dicts(df)
+
+async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E") -> List[dict]:
+    pro = get_pro()
+    start = start_date.replace("-", "")
+    end = end_date.replace("-", "")
+    try:
+        df_list: DataFrame = pro.fund_basic(market=market)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
+    funds = df_list_to_rows(df_list, ["ts_code", "name"])
+    results: List[dict] = []
+    for fund in funds:
+        code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
+        name = fund.get("name") or fund.get("fund_name")
+        if not code:
+            continue
+        try:
+            nav_df: DataFrame = pro.fund_nav(ts_code=code, start_date=start, end_date=end)
+        except Exception as exc:
+            results.append({"ts_code": code, "name": name, "error": str(exc)})
+            continue
+        if nav_df.empty or len(nav_df.index) < 2:
+            continue
+        price_col: Optional[str] = None
+        for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
+            if candidate in nav_df.columns:
+                price_col = candidate
+                break
+        if price_col is None:
+            continue
+        start_price = nav_df.iloc[0][price_col]
+        end_price = nav_df.iloc[-1][price_col]
+        try:
+            start_float = float(start_price)
+            end_float = float(end_price)
+        except Exception:
+            continue
+        if start_float == 0:
+            continue
+        change = (end_float - start_float) / start_float * 100
+        results.append(
+            {
+                "ts_code": code,
+                "name": name,
+                "start_price": start_float,
+                "end_price": end_float,
+                "change_pct": round(change, 2),
+            }
+        )
+    return results
+
+
+TOOLS: List[Tool] = [
+    Tool(
+        name="list_etfs",
+        description="List all ETF funds available on the Chinese A-share market.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "market": {
+                    "type": "string",
+                    "description": "Market code to filter ETF types (default 'E')",
+                    "default": "E",
+                },
+            },
+            "required": [],
+        },
+        run=tool_list_etfs,
+    ),
+    Tool(
+        name="etf_history",
+        description="Get historical NAV data for a specific ETF.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "ts_code": {
+                    "type": "string",
+                    "description": "TuShare code of the ETF (e.g. 510300.SH)",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date in YYYYMMDD format (optional)",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date in YYYYMMDD format (optional)",
+                },
+            },
+            "required": ["ts_code"],
+        },
+        run=tool_etf_history,
+    ),
+    Tool(
+        name="etf_holdings",
+        description="Get holdings for a specific ETF over an optional date range.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "ts_code": {
+                    "type": "string",
+                    "description": "TuShare code of the ETF",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date in YYYYMMDD format (optional)",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date in YYYYMMDD format (optional)",
+                },
+            },
+            "required": ["ts_code"],
+        },
+        run=tool_etf_holdings,
+    ),
+    Tool(
+        name="etf_performance",
+        description="Compute percentage change over an interval for all ETFs.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date in YYYYMMDD format",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date in YYYYMMDD format",
+                },
+                "market": {
+                    "type": "string",
+                    "description": "Market code to filter ETF types (default 'E')",
+                    "default": "E",
+                },
+            },
+            "required": ["start_date", "end_date"],
+        },
+        run=tool_etf_performance,
+    ),
+]
+
+@app.get("/.well-known/mcp-config")
+async def mcp_config() -> dict:
+    return {
+        "transport": "streamable-http",
+        "endpoint": "/mcp",
+        "name": "ETF MCP Server",
+        "version": app.version,
+        "description": app.description,
+        "tools": [tool.name for tool in TOOLS],
+    }
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "healthy", "transport": "streamable-http"}
+
+@app.post("/mcp")
+async def mcp_handler(request: Request) -> dict:
+    body = await request.json()
+    method = body.get("method")
+    request_id = body.get("id")
+
+    def reply(result: Optional[dict] = None, *, error: Optional[dict] = None) -> dict:
+        if error:
+            return {"jsonrpc": "2.0", "error": error, "id": request_id}
+        else:
+            return {"jsonrpc": "2.0", "result": result, "id": request_id}
+
+    if method == "initialize":
+        return reply(
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "ETF MCP Server", "version": app.version},
+            }
+        )
+    if method == "tools/list":
+        return reply({"tools": [tool.as_dict() for tool in TOOLS]})
+    if method == "resources/list":
+        return reply({"resources": []})
+    if method == "prompts/list":
+        return reply({"prompts": []})
+    if method == "tools/call":
+        params = body.get("params", {}) or {}
+        name = params.get("name")
+        args = params.get("arguments", {}) or {}
+        tool = next((t for t in TOOLS if t.name == name), None)
+        if tool is None:
+            return reply(error={"code": -32601, "message": f"Unknown tool: {name}"})
+        try:
+            result = await tool.run(**args)
+            return reply(result=result)
+        except HTTPException as http_exc:
+            return reply(error={"code": -32000, "message": http_exc.detail})
+        except Exception as exc:
+            return reply(error={"code": -32603, "message": str(exc)})
+    return reply(error={"code": -32601, "message": f"Method not found: {method}"})
