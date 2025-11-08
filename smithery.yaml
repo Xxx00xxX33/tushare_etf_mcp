@@ -1,36 +1,25 @@
 # Smithery configuration file for the ETF MCP server.
-#
-# This file tells Smithery how to build and run your Model‑Context‑Protocol (MCP)
-# server.  It includes metadata such as the name, version and description of
-# the server, build instructions, and the start command.  See the official
-# documentation for details:
-# https://streamable-http.ai/docs/build/project-config/smithery.yaml
+
+# This file tells Smithery how to build and run your Model-Context-Protocol (MCP)
+# server. It includes metadata such as the name, version and description of
+# the server, build instructions, and the start command.
 
 name: "@Xxx00xxX33/etf_mcp"
 version: "0.1.0"
-description: "Chinese A‑share ETF data MCP using TuShare API and FastAPI."
+description: "Chinese A-Share ETF data MCP using TuShare API and FastAPI."
 author:
   name: "Xxx00xxX33"
   email: "your-email@example.com"
 license: "MIT"
 keywords: [etf, tushare, finance, mcp-server]
 runtime: python
-
-# Specify the Python version requirement for this server.  Smithery will
-# provision the appropriate runtime when building the container.
 dependencies:
-  python: ">=3.10"
+  python: "~3.10"
 
-# Build configuration.  Smithery uses the specified Dockerfile to build
-# a container image for your server.  The build context defaults to the
-# repository root (".") but you can override it here.
 build:
   dockerfile: Dockerfile
   dockerBuildPath: "."
 
-# Start command definition.  The `http` type tells Smithery that this
-# server uses the streamable HTTP transport.  The `configSchema` defines
-# configuration options that users may provide when deploying the server.
 startCommand:
   type: http
   configSchema:
@@ -39,30 +28,16 @@ startCommand:
       TUSHARE_TOKEN:
         type: string
         title: "TuShare API Token (Optional)"
-        description: >
-          Optional default TuShare API token.  Users can override this by
-          providing their own token via an HTTP header (X‑Tushare‑Token,
-          Authorization: Bearer <token> or X‑Api‑Key) when connecting.
-    # No required fields; the server will still run if no token is provided.
-
-  # The commandFunction is a JavaScript function executed by Smithery to
-  # construct the actual command that starts your server.  It receives the
-  # user‑provided configuration (config) and must return an object with
-  # `command`, `args` and `env` properties.  Here we start uvicorn to run
-  # the FastAPI app defined in main.py.
-  commandFunction: |-
+        description: "Optional default TuShare API token. Users can override this by providing their own token via the X-Tushare-Token header or Authorization: Bearer <token> when connecting."
+    required: []
+  commandFunction: |
     (config) => ({
       command: "uvicorn",
       args: ["main:app", "--host", "0.0.0.0", "--port", "8000"],
       env: {
-        "TUSHARE_TOKEN": config.TUSHARE_TOKEN || "",
-        "PYTHONUNBUFFERED": "1",
-        "PORT": "8000"
+        "TUSHARE_TOKEN": config.TUSHARE_TOKEN || ""
       }
     })
 
-# Example configuration used by the Smithery UI to pre‑populate fields.
-# Deployers can leave the token empty, prompting end users to supply
-# their own when connecting.
 exampleConfig:
-  TUSHARE_TOKEN: "your_tushare_token_here_or_leave_empty"
+  TUSHARE_TOKEN: ""
