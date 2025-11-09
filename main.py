@@ -3,6 +3,7 @@ import json
 import asyncio
 from datetime import datetime
 from typing import AsyncGenerator, Callable, Iterable, List, Optional
+from functools import partial
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, PlainTextResponse
@@ -56,7 +57,7 @@ def df_to_dicts(df: "DataFrame") -> List[dict]:
     """Convert a pandas DataFrame into a list of dictionaries.
 
     This helper is defined separately so that the TuShare import can fail
-    gracefully until actually needed.  The JSON conversion uses pandas’
+    gracefully until actually needed.  The JSON conversion uses pandas'
     built‑in method for performance and consistent field names.
     """
     return df.to_dict(orient="records")
@@ -70,7 +71,7 @@ async def stream_json_lines(rows: Iterable[dict]) -> AsyncGenerator[bytes, None]
     the event loop between items.
     """
     for row in rows:
-        # Use ensure_ascii=False so Chinese names aren’t escaped
+        # Use ensure_ascii=False so Chinese names aren't escaped
         line = json.dumps(row, ensure_ascii=False) + "\n"
         yield line.encode("utf-8")
         # Avoid blocking the event loop for large datasets
@@ -94,169 +95,147 @@ async def list_etfs(market: str = Query("E", description="Market code, default '
     """Stream the list of ETF funds from TuShare.
 
     The `market` parameter is passed to `pro.fund_basic` to filter the type
-    of funds returned.  According to TuShare’s documentation the value `'E'`
+    of funds returned.  According to TuShare's documentation the value `'E'`
     selects ETF products.  Each row is emitted as a JSON object on its own
     line.  If the API call fails, a HTTPException is raised.
     """
     pro = get_pro()
     try:
-        df: DataFrame = pro.fund_basic(market=market)
+        # Run blocking Tushare call in thread pool
+        df: DataFrame = await asyncio.to_thread(pro.fund_basic, market=market)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     rows = df_to_dicts(df)
-    return StreamingResponse(stream_json_lines(rows), media_type="application/json")
+    return StreamingResponse(stream_json_lines(rows), media_type="application/x-ndjson")
 
 
 @app.get("/etf/{ts_code}/history")
 async def etf_history(
     ts_code: str,
-    start_date: Optional[str] = Query(None, description="Start date in YYYYMMDD format"),
-    end_date: Optional[str] = Query(None, description="End date in YYYYMMDD format"),
+    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD or YYYYMMDD format"),
+    end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD or YYYYMMDD format"),
 ) -> StreamingResponse:
-    """Stream the historical NAV data for a given ETF.
+    """Stream historical NAV data for a single ETF.
 
-    Parameters:
-    - `ts_code` – the TuShare code of the fund (e.g. `510300.SH`).
-    - `start_date`, `end_date` – optional date range filters.  If omitted,
-      TuShare will return the entire history available.  Dates must be
-      provided in `YYYYMMDD` format; any dashes will be removed.
-    The response is a stream of JSON lines containing the NAV records.
+    The `ts_code` path parameter identifies the fund.  Optional `start_date`
+    and `end_date` query parameters can restrict the date range.  Dates may
+    be supplied in either YYYY‑MM‑DD or YYYYMMDD format; hyphens are stripped
+    before passing to TuShare.
     """
     pro = get_pro()
-    # Normalize dates to the expected format (remove dashes if present)
-    def normalise_date(value: Optional[str]) -> Optional[str]:
+
+    def normalise(value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         return value.replace("-", "")
 
-    start = normalise_date(start_date)
-    end = normalise_date(end_date)
+    start = normalise(start_date)
+    end = normalise(end_date)
     try:
-        df: DataFrame = pro.fund_nav(ts_code=ts_code, start_date=start, end_date=end)
+        # Run blocking Tushare call in thread pool
+        df: DataFrame = await asyncio.to_thread(pro.fund_nav, ts_code=ts_code, start_date=start, end_date=end)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     rows = df_to_dicts(df)
-    return StreamingResponse(stream_json_lines(rows), media_type="application/json")
+    return StreamingResponse(stream_json_lines(rows), media_type="application/x-ndjson")
 
 
 @app.get("/etf/{ts_code}/holdings")
 async def etf_holdings(
     ts_code: str,
-    start_date: Optional[str] = Query(None, description="Start date in YYYYMMDD format (optional)"),
-    end_date: Optional[str] = Query(None, description="End date in YYYYMMDD format (optional)"),
+    start_date: Optional[str] = Query(None, description="Start date in YYYY-MM-DD or YYYYMMDD format"),
+    end_date: Optional[str] = Query(None, description="End date in YYYY-MM-DD or YYYYMMDD format"),
 ) -> StreamingResponse:
-    """Stream the component holdings for a given ETF.
+    """Stream constituent holdings for a single ETF.
 
-    This endpoint queries TuShare’s `fund_portfolio` interface which returns
-    quarterly composition information for mutual funds and ETFs.  You may
-    optionally supply a start/end date to restrict the quarters returned.
-
-    Returned records include fields such as `stk_code` (stock code), `name`
-    (stock name) and `weight` (percentage of the fund).  See TuShare
-    documentation for more details.
+    The `ts_code` path parameter identifies the fund.  Optional `start_date`
+    and `end_date` query parameters can restrict the date range.  Dates may
+    be supplied in either YYYY‑MM‑DD or YYYYMMDD format; hyphens are stripped
+    before passing to TuShare.
     """
     pro = get_pro()
-    # Normalise dates
-    def normalise_date(value: Optional[str]) -> Optional[str]:
+
+    def normalise(value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         return value.replace("-", "")
 
-    start = normalise_date(start_date)
-    end = normalise_date(end_date)
+    start = normalise(start_date)
+    end = normalise(end_date)
     try:
-        df: DataFrame = pro.fund_portfolio(ts_code=ts_code, start_date=start, end_date=end)
+        # Run blocking Tushare call in thread pool
+        df: DataFrame = await asyncio.to_thread(pro.fund_portfolio, ts_code=ts_code, start_date=start, end_date=end)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     rows = df_to_dicts(df)
-    return StreamingResponse(stream_json_lines(rows), media_type="application/json")
+    return StreamingResponse(stream_json_lines(rows), media_type="application/x-ndjson")
 
 
 @app.get("/etf_performance")
 async def etf_performance(
-    start_date: str = Query(..., description="Start date in YYYYMMDD format"),
-    end_date: str = Query(..., description="End date in YYYYMMDD format"),
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD or YYYYMMDD format"),
+    end_date: str = Query(..., description="End date in YYYY-MM-DD or YYYYMMDD format"),
     market: str = Query("E", description="Market code, default 'E' for ETFs"),
 ) -> StreamingResponse:
-    """Stream the percentage change in NAV over a given interval for all ETFs.
+    """Stream interval performance for all ETFs.
 
-    The server will query `fund_basic` to obtain the list of ETFs and then
-    individually request NAV data for each ETF between the supplied dates.
-    For each ETF with at least two NAV entries in the interval the function
-    computes the percentage change:
-
-        (NAV_end − NAV_start) / NAV_start × 100
-
-    The results are streamed progressively as JSON objects with the
-    following fields:
-
-    - `ts_code` – ETF TuShare code
-    - `name` – ETF name
-    - `start_price` – first NAV value in the interval
-    - `end_price` – last NAV value in the interval
-    - `change_pct` – percentage change rounded to 2 decimal places
-
-    Notes:
-    - The computation is synchronous within the request; depending on the
-      number of ETFs and TuShare API quotas this call may take some time.
-    - Dates must be supplied in `YYYYMMDD` format (dashes are removed automatically).
+    For each ETF in the given market, this endpoint retrieves historical NAV
+    data between `start_date` and `end_date`, then computes the percentage
+    change from the first to the last available price.  Results are streamed
+    as JSON lines.  Funds with insufficient data or errors are skipped.
     """
     pro = get_pro()
-    # Normalise input dates
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
+
     try:
-        df_list: DataFrame = pro.fund_basic(market=market)
+        # Run blocking Tushare call in thread pool
+        df_list: DataFrame = await asyncio.to_thread(pro.fund_basic, market=market)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
-    # Convert DataFrame to list of dicts for iteration
+
     funds = df_list_to_rows(df_list, ["ts_code", "name"])
 
-    async def performance_generator() -> AsyncGenerator[bytes, None]:
+    async def generate_performance() -> AsyncGenerator[bytes, None]:
         for fund in funds:
-            ts_code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
+            code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
             name = fund.get("name") or fund.get("fund_name")
-            if not ts_code:
+            if not code:
                 continue
-            # Fetch NAV history for this fund
             try:
-                nav_df: DataFrame = pro.fund_nav(ts_code=ts_code, start_date=start, end_date=end)
+                # Run blocking Tushare call in thread pool
+                nav_df: DataFrame = await asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end)
             except Exception as exc:
-                # Skip funds that error out
-                result = {
-                    "ts_code": ts_code,
-                    "name": name,
-                    "error": str(exc),
-                }
-                line = json.dumps(result, ensure_ascii=False) + "\n"
+                error_row = {"ts_code": code, "name": name, "error": str(exc)}
+                line = json.dumps(error_row, ensure_ascii=False) + "\n"
                 yield line.encode("utf-8")
-                await asyncio.sleep(0)
                 continue
+
             if nav_df.empty or len(nav_df.index) < 2:
-                # Not enough data to compute a change
                 continue
-            # Determine which column to use for price
-            price_col = None
+
+            price_col: Optional[str] = None
             for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
                 if candidate in nav_df.columns:
                     price_col = candidate
                     break
             if price_col is None:
-                # Unexpected schema, skip
                 continue
+
             start_price = nav_df.iloc[0][price_col]
             end_price = nav_df.iloc[-1][price_col]
-            # Handle possible None or non‑numeric values
             try:
                 start_float = float(start_price)
                 end_float = float(end_price)
             except Exception:
                 continue
+
             if start_float == 0:
                 continue
+
             change = (end_float - start_float) / start_float * 100
             result = {
-                "ts_code": ts_code,
+                "ts_code": code,
                 "name": name,
                 "start_price": start_float,
                 "end_price": end_float,
@@ -265,24 +244,21 @@ async def etf_performance(
             line = json.dumps(result, ensure_ascii=False) + "\n"
             yield line.encode("utf-8")
             await asyncio.sleep(0)
-    return StreamingResponse(performance_generator(), media_type="application/json")
+
+    return StreamingResponse(generate_performance(), media_type="application/x-ndjson")
 
 
 def df_list_to_rows(df: "DataFrame", columns: List[str]) -> List[dict]:
-    """Return a list of dictionaries with only selected columns from a DataFrame.
+    """Extract specific columns from a DataFrame and return as a list of dicts."""
+    if df.empty:
+        return []
+    available = [c for c in columns if c in df.columns]
+    if not available:
+        return []
+    return df[available].to_dict(orient="records")
 
-    If a column is missing in the DataFrame it will be omitted in the resulting
-    dictionaries.  This helper is used for iterating over ETF metadata.
-    """
-    if df is None:
-        return []
-    # Only use available columns
-    available_cols = [c for c in columns if c in df.columns]
-    if not available_cols:
-        return []
-    return df[available_cols].to_dict(orient="records")
+
 # MCP code start
-from fastapi import Request
 
 class Tool:
     """Simple container for MCP tool metadata and execution logic."""
@@ -301,64 +277,117 @@ class Tool:
         }
 
 
-async def tool_list_etfs(*, market: str = "E") -> List[dict]:
+async def tool_list_etfs(*, market: str = "E") -> dict:
+    """MCP tool: List all ETF funds."""
     pro = get_pro()
     try:
-        df: DataFrame = pro.fund_basic(market=market)
+        # Run blocking Tushare call in thread pool with timeout
+        df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_basic, market=market),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
-    return df_to_dicts(df)
+    
+    rows = df_to_dicts(df)
+    return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
 
-async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[dict]:
+
+async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
+    """MCP tool: Get historical NAV data for an ETF."""
     pro = get_pro()
+
     def normalise(value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         return value.replace("-", "")
+
     start = normalise(start_date)
     end = normalise(end_date)
     try:
-        df: DataFrame = pro.fund_nav(ts_code=ts_code, start_date=start, end_date=end)
+        # Run blocking Tushare call in thread pool with timeout
+        df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_nav, ts_code=ts_code, start_date=start, end_date=end),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
-    return df_to_dicts(df)
+    
+    rows = df_to_dicts(df)
+    return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
 
-async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[dict]:
+
+async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
+    """MCP tool: Get constituent holdings for an ETF."""
     pro = get_pro()
+
     def normalise(value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         return value.replace("-", "")
+
     start = normalise(start_date)
     end = normalise(end_date)
     try:
-        df: DataFrame = pro.fund_portfolio(ts_code=ts_code, start_date=start, end_date=end)
+        # Run blocking Tushare call in thread pool with timeout
+        df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_portfolio, ts_code=ts_code, start_date=start, end_date=end),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
-    return df_to_dicts(df)
+    
+    rows = df_to_dicts(df)
+    return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
 
-async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E") -> List[dict]:
+
+async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E") -> dict:
+    """MCP tool: Calculate interval performance for all ETFs."""
     pro = get_pro()
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
+    
     try:
-        df_list: DataFrame = pro.fund_basic(market=market)
+        # Run blocking Tushare call in thread pool with timeout
+        df_list: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_basic, market=market),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
+    
     funds = df_list_to_rows(df_list, ["ts_code", "name"])
     results: List[dict] = []
+    
     for fund in funds:
         code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
         name = fund.get("name") or fund.get("fund_name")
         if not code:
             continue
         try:
-            nav_df: DataFrame = pro.fund_nav(ts_code=code, start_date=start, end_date=end)
+            # Run blocking Tushare call in thread pool with timeout
+            nav_df: DataFrame = await asyncio.wait_for(
+                asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            results.append({"ts_code": code, "name": name, "error": "Request timed out"})
+            continue
         except Exception as exc:
             results.append({"ts_code": code, "name": name, "error": str(exc)})
             continue
+        
         if nav_df.empty or len(nav_df.index) < 2:
             continue
+        
         price_col: Optional[str] = None
         for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
             if candidate in nav_df.columns:
@@ -366,6 +395,7 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
                 break
         if price_col is None:
             continue
+        
         start_price = nav_df.iloc[0][price_col]
         end_price = nav_df.iloc[-1][price_col]
         try:
@@ -373,8 +403,10 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
             end_float = float(end_price)
         except Exception:
             continue
+        
         if start_float == 0:
             continue
+        
         change = (end_float - start_float) / start_float * 100
         results.append(
             {
@@ -385,7 +417,10 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
                 "change_pct": round(change, 2),
             }
         )
-    return results
+        # Yield control to event loop
+        await asyncio.sleep(0)
+    
+    return {"content": [{"type": "text", "text": json.dumps(results, ensure_ascii=False, indent=2)}]}
 
 
 TOOLS: List[Tool] = [
@@ -399,29 +434,29 @@ TOOLS: List[Tool] = [
                     "type": "string",
                     "description": "Market code to filter ETF types (default 'E')",
                     "default": "E",
-                },
+                }
             },
             "required": [],
         },
         run=tool_list_etfs,
     ),
     Tool(
-        name="etf_history",
-        description="Get historical NAV data for a specific ETF.",
+        name="get_etf_history",
+        description="Retrieve historical NAV (Net Asset Value) data for a specific ETF.",
         input_schema={
             "type": "object",
             "properties": {
                 "ts_code": {
                     "type": "string",
-                    "description": "TuShare code of the ETF (e.g. 510300.SH)",
+                    "description": "TuShare code of the ETF (e.g., '510050.SH')",
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date in YYYYMMDD format (optional)",
+                    "description": "Start date in YYYY-MM-DD or YYYYMMDD format (optional)",
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date in YYYYMMDD format (optional)",
+                    "description": "End date in YYYY-MM-DD or YYYYMMDD format (optional)",
                 },
             },
             "required": ["ts_code"],
@@ -429,22 +464,22 @@ TOOLS: List[Tool] = [
         run=tool_etf_history,
     ),
     Tool(
-        name="etf_holdings",
-        description="Get holdings for a specific ETF over an optional date range.",
+        name="get_etf_holdings",
+        description="Retrieve constituent holdings for a specific ETF.",
         input_schema={
             "type": "object",
             "properties": {
                 "ts_code": {
                     "type": "string",
-                    "description": "TuShare code of the ETF",
+                    "description": "TuShare code of the ETF (e.g., '510050.SH')",
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date in YYYYMMDD format (optional)",
+                    "description": "Start date in YYYY-MM-DD or YYYYMMDD format (optional)",
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date in YYYYMMDD format (optional)",
+                    "description": "End date in YYYY-MM-DD or YYYYMMDD format (optional)",
                 },
             },
             "required": ["ts_code"],
@@ -452,18 +487,18 @@ TOOLS: List[Tool] = [
         run=tool_etf_holdings,
     ),
     Tool(
-        name="etf_performance",
-        description="Compute percentage change over an interval for all ETFs.",
+        name="get_etf_performance",
+        description="Calculate interval performance (percentage change) for all ETFs between two dates.",
         input_schema={
             "type": "object",
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "Start date in YYYYMMDD format",
+                    "description": "Start date in YYYY-MM-DD or YYYYMMDD format",
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date in YYYYMMDD format",
+                    "description": "End date in YYYY-MM-DD or YYYYMMDD format",
                 },
                 "market": {
                     "type": "string",
@@ -476,6 +511,7 @@ TOOLS: List[Tool] = [
         run=tool_etf_performance,
     ),
 ]
+
 
 @app.get("/.well-known/mcp-config")
 async def mcp_config() -> dict:
