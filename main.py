@@ -619,7 +619,7 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
                 
                 if not nav_df.empty and len(nav_df) >= 2:
                     # 按日期排序
-                    nav_df_sorted = nav_df.sort_values(by='end_date')
+                    nav_df_sorted = nav_df.sort_values(by='nav_date')
                     
                     # 计算涨幅
                     start_nav = nav_df_sorted.iloc[0]['unit_nav']
