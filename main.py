@@ -531,6 +531,41 @@ async def tool_top_etfs_by_period(*, period: str = "day", limit: int = 10, marke
         )
 
 
+def is_a_share_etf(code: str, name: str) -> bool:
+    """
+    判断是否为A股ETF（排除港股ETF和其他非A股ETF）
+    
+    Args:
+        code: ETF代码
+        name: ETF名称
+    
+    Returns:
+        True if A股ETF, False otherwise
+    """
+    # 排除条件1: 代码以513开头的港股ETF
+    if code.startswith('513'):
+        return False
+    
+    # 排除条件2: 名称中包含港股相关关键词
+    hk_keywords = ['港股', '香港', '恒生', '恒指', 'H股', 'HK', '港', '中概']
+    if any(keyword in name for keyword in hk_keywords):
+        return False
+    
+    # 排除条件3: 美股、日本、欧洲等海外市场ETF
+    overseas_keywords = ['美股', '纳斯达克', '标普', 'NASDAQ', 'S&P', '日本', '欧洲', '德国', '法国']
+    if any(keyword in name for keyword in overseas_keywords):
+        return False
+    
+    # 保留条件: 上交所和深交所的主流A股ETF
+    # 上交所: 51xxxx, 58xxxx (但513xxx是港股)
+    # 深交所: 15xxxx, 16xxxx
+    if code.startswith(('510', '511', '512', '515', '516', '518', '588', '150', '159', '160')):
+        return True
+    
+    # 其他情况默认保留（谨慎起见）
+    return True
+
+
 async def _get_day_top_etfs(limit: int) -> list:
     """
     使用 AkShare 获取当日涨幅排行前 N 的 ETF（快速）
@@ -548,8 +583,11 @@ async def _get_day_top_etfs(limit: int) -> list:
             timeout=10.0
         )
         
+        # 过滤掉港股ETF和海外ETF
+        df_filtered = df[df.apply(lambda row: is_a_share_etf(str(row['代码']), str(row['名称'])), axis=1)]
+        
         # 按涨跌幅降序排序
-        df_sorted = df.sort_values(by='涨跌幅', ascending=False)
+        df_sorted = df_filtered.sort_values(by='涨跌幅', ascending=False)
         
         # 取前 N 个
         top_n = df_sorted.head(limit)
@@ -594,10 +632,19 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
         if funds_df.empty:
             return []
         
-        # 2. 限制处理数量（处理 3 倍数量以确保有足够的有效数据）
-        funds_to_process = funds_df.head(limit * 3)
+        # 2. 过滤掉港股ETF和海外ETF
+        funds_filtered = funds_df[funds_df.apply(
+            lambda row: is_a_share_etf(
+                str(row['ts_code'])[:6],  # 取前6位代码
+                str(row['name'])
+            ), 
+            axis=1
+        )]
         
-        # 3. 计算每个 ETF 的涨幅
+        # 3. 限制处理数量（处理 3 倍数量以确保有足够的有效数据）
+        funds_to_process = funds_filtered.head(limit * 3)
+        
+        # 4. 计算每个 ETF 的涨幅
         results = []
         overall_start = time.time()
         
