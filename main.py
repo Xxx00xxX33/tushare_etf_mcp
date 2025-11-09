@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import AsyncGenerator, Callable, Iterable, List, Optional
 from functools import partial
 
@@ -12,10 +12,12 @@ from sse_starlette.sse import EventSourceResponse
 try:
     import tushare as ts  # type: ignore
     from pandas import DataFrame  # type: ignore
+    import akshare as ak  # type: ignore
 except Exception:
     # We defer ImportError until runtime; see get_pro() below
     ts = None  # type: ignore
     DataFrame = None  # type: ignore
+    ak = None  # type: ignore
 
 
 app = FastAPI(
@@ -447,6 +449,216 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
         ]
     }
 
+import time
+
+async def tool_top_etfs_by_period(*, period: str = "day", limit: int = 10, market: str = "E") -> dict:
+    """
+    获取指定时间周期内涨幅排行前 N 的 ETF
+    
+    Args:
+        period: 时间周期，"day"=当日涨幅, "week"=近一周涨幅, "month"=近一月涨幅
+        limit: 返回数量，默认 10
+        market: 市场类型，"E"=ETF, "O"=LOF
+    
+    Returns:
+        MCP 格式的响应，包含涨幅排行前 N 的 ETF
+    """
+    start_time = time.time()
+    
+    try:
+        if period == "day":
+            # 使用 AkShare 获取当日涨幅排行（快速）
+            results = await _get_day_top_etfs(limit)
+            period_desc = "当日"
+        elif period == "week":
+            # 使用 Tushare 计算近一周涨幅
+            results = await _get_period_top_etfs(days=7, limit=limit, market=market)
+            period_desc = "近一周"
+        elif period == "month":
+            # 使用 Tushare 计算近一月涨幅
+            results = await _get_period_top_etfs(days=30, limit=limit, market=market)
+            period_desc = "近一月"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid period: {period}. Must be one of: day, week, month"
+            )
+        
+        elapsed = time.time() - start_time
+        
+        # 格式化输出
+        output_lines = [f"{period_desc}涨幅前 {len(results)} 的 ETF：\n"]
+        
+        for i, etf in enumerate(results, 1):
+            if period == "day":
+                line = (
+                    f"{i}. {etf['名称']} ({etf['代码']})\n"
+                    f"   最新价: {etf['最新价']:.2f}  "
+                    f"涨跌幅: {etf['涨跌幅']:.2f}%  "
+                    f"成交额: {etf['成交额']/100000000:.2f}亿\n"
+                    f"   主力净流入: {etf['主力净流入-净额']/100000000:.2f}亿\n"
+                )
+            else:
+                line = (
+                    f"{i}. {etf['name']} ({etf['ts_code']})\n"
+                    f"   {period_desc}涨幅: {etf['gain']:.2f}%\n"
+                )
+            output_lines.append(line)
+        
+        output_lines.append(f"\n处理时间: {elapsed:.1f} 秒")
+        
+        if period != "day" and len(results) < limit:
+            output_lines.append(
+                f"\n注意: 仅返回 {len(results)} 个 ETF（部分 ETF 数据不足或获取失败）"
+            )
+        
+        return {
+            "content": [{
+                "type": "text",
+                "text": "".join(output_lines)
+            }]
+        }
+        
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Request timed out while fetching {period} ETF performance data"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching {period} ETF performance: {exc}"
+        )
+
+
+async def _get_day_top_etfs(limit: int) -> list:
+    """
+    使用 AkShare 获取当日涨幅排行前 N 的 ETF（快速）
+    """
+    if ak is None:
+        raise HTTPException(
+            status_code=500,
+            detail="The 'akshare' library is not installed. Please install it via requirements.txt."
+        )
+    
+    try:
+        # 在线程池中执行，避免阻塞事件循环
+        df = await asyncio.wait_for(
+            asyncio.to_thread(ak.fund_etf_spot_em),
+            timeout=10.0
+        )
+        
+        # 按涨跌幅降序排序
+        df_sorted = df.sort_values(by='涨跌幅', ascending=False)
+        
+        # 取前 N 个
+        top_n = df_sorted.head(limit)
+        
+        # 转换为字典列表
+        results = top_n.to_dict(orient='records')
+        
+        return results
+        
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="AkShare API request timed out after 10 seconds"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AkShare API error: {exc}"
+        )
+
+
+async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
+    """
+    使用 Tushare 计算指定天数内的涨幅排行
+    """
+    pro = get_pro()
+    
+    # 计算日期范围
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    
+    start_date_str = start_date.strftime('%Y%m%d')
+    end_date_str = end_date.strftime('%Y%m%d')
+    
+    try:
+        # 1. 获取 ETF 列表
+        funds_df = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_basic, market=market),
+            timeout=15.0
+        )
+        
+        if funds_df.empty:
+            return []
+        
+        # 2. 限制处理数量（处理 3 倍数量以确保有足够的有效数据）
+        funds_to_process = funds_df.head(limit * 3)
+        
+        # 3. 计算每个 ETF 的涨幅
+        results = []
+        overall_start = time.time()
+        
+        for _, fund in funds_to_process.iterrows():
+            # 整体超时保护
+            if time.time() - overall_start > 50:
+                break
+            
+            try:
+                nav_df = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        pro.fund_nav,
+                        ts_code=fund['ts_code'],
+                        start_date=start_date_str,
+                        end_date=end_date_str
+                    ),
+                    timeout=10.0
+                )
+                
+                if not nav_df.empty and len(nav_df) >= 2:
+                    # 按日期排序
+                    nav_df_sorted = nav_df.sort_values(by='end_date')
+                    
+                    # 计算涨幅
+                    start_nav = nav_df_sorted.iloc[0]['unit_nav']
+                    end_nav = nav_df_sorted.iloc[-1]['unit_nav']
+                    
+                    if start_nav and end_nav and start_nav > 0:
+                        gain = (end_nav - start_nav) / start_nav * 100
+                        
+                        results.append({
+                            'ts_code': fund['ts_code'],
+                            'name': fund['name'],
+                            'gain': gain,
+                            'start_nav': start_nav,
+                            'end_nav': end_nav
+                        })
+                
+            except asyncio.TimeoutError:
+                # 单个 ETF 超时，跳过继续处理下一个
+                continue
+            except Exception:
+                # 其他错误也跳过
+                continue
+        
+        # 4. 按涨幅降序排序并取前 N 个
+        results_sorted = sorted(results, key=lambda x: x['gain'], reverse=True)
+        return results_sorted[:limit]
+        
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"TuShare API request timed out while fetching ETF list"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"TuShare API error: {exc}"
+        )
+
+
 
 TOOLS: List[Tool] = [
     Tool(
@@ -539,6 +751,35 @@ TOOLS: List[Tool] = [
             "required": ["start_date", "end_date"],
         },
         run=tool_etf_performance,
+    ),
+    Tool(
+        name="get_top_etfs_by_period",
+        description="Get top N ETFs by gain/loss for a specific time period (day/week/month). Uses fast AkShare API for daily data, Tushare for weekly/monthly.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "description": "Time period: 'day' for daily gain, 'week' for weekly gain, 'month' for monthly gain",
+                    "enum": ["day", "week", "month"],
+                    "default": "day",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of top ETFs to return (default 10)",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+                "market": {
+                    "type": "string",
+                    "description": "Market code: 'E' for ETF, 'O' for LOF (default 'E')",
+                    "default": "E",
+                },
+            },
+            "required": [],
+        },
+        run=tool_top_etfs_by_period,
     ),
 ]
 
