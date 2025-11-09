@@ -21,6 +21,9 @@ applications that need structured financial data.
   waiting for the entire calculation to complete.
 - **Holdings / components** – Retrieve the latest reported holdings (constituent
   stocks) of a specific ETF.
+- **Top ETFs by period** – Get top N ETFs ranked by gain/loss for a specific
+  time period (day/week/month). Uses fast AkShare API for daily data (2-3s),
+  Tushare for weekly/monthly data (20-40s).
 
 ### Running locally
 
