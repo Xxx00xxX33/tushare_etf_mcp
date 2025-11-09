@@ -12,9 +12,7 @@ author:
   email: "your-email@example.com"
 license: "MIT"
 keywords: [etf, tushare, finance, mcp-server]
-runtime: python
-dependencies:
-  python: "~3.10"
+
 
 build:
   dockerfile: Dockerfile
