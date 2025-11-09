@@ -1,3 +1,5 @@
+[![smithery badge](https://smithery.ai/badge/@Xxx00xxX33/tushare_etf_mcp)](https://smithery.ai/server/@Xxx00xxX33/tushare_etf_mcp)
+
 ## ETF MCP Server
 
 This repository contains a simple **Model‑Context‑Protocol (MCP)** server built
@@ -24,7 +26,7 @@ applications that need structured financial data.
 
 ### Running locally
 
-1. Install the dependencies.  At minimum you'll need Python 3.9+.
+1. Install the dependencies.  At minimum you'll need Python 3.9+.
 
 ```bash
 pip install -r requirements.txt
@@ -45,12 +47,12 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 4. Open your browser at `http://localhost:8000` to see the available
-   endpoints.  The API is self‑documenting via FastAPI’s OpenAPI UI.
+   endpoints.  The API is self‑documenting via FastAPI's OpenAPI UI.
 
 ### Smithery deployment
 
 The server is built on top of FastAPI and uses `StreamingResponse` for all
-methods.  Smithery’s streamable HTTP transport understands standard HTTP
+methods.  Smithery's streamable HTTP transport understands standard HTTP
 streaming – there is no dependency on WebSockets – so you can deploy this
 repository as a remote MCP on platforms supported by Smithery (e.g. Apify,
 Vercel or your own infrastructure).
@@ -76,7 +78,7 @@ All date parameters should be in `YYYYMMDD` format (e.g. `20250101`).  If
 
 ### Note on TuShare data
 
-TuShare’s ETF endpoints are subject to API limits and may return different
+TuShare's ETF endpoints are subject to API limits and may return different
 fields depending on your subscription level.  This server assumes the
 presence of the following fields:
 
