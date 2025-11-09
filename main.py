@@ -4,8 +4,9 @@ import asyncio
 from datetime import datetime
 from typing import AsyncGenerator, Callable, Iterable, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, PlainTextResponse
+from sse_starlette.sse import EventSourceResponse
 
 try:
     import tushare as ts  # type: ignore
@@ -492,7 +493,8 @@ async def health() -> dict:
     return {"status": "healthy", "transport": "streamable-http"}
 
 @app.post("/mcp")
-async def mcp_handler(request: Request) -> dict:
+async def mcp_handler(request: Request):
+    """MCP protocol handler with Server-Sent Events (SSE) transport."""
     body = await request.json()
     method = body.get("method")
     request_id = body.get("id")
@@ -503,32 +505,46 @@ async def mcp_handler(request: Request) -> dict:
         else:
             return {"jsonrpc": "2.0", "result": result, "id": request_id}
 
+    # Generate response based on method
+    response_data = None
+    
     if method == "initialize":
-        return reply(
+        response_data = reply(
             {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "ETF MCP Server", "version": app.version},
             }
         )
-    if method == "tools/list":
-        return reply({"tools": [tool.as_dict() for tool in TOOLS]})
-    if method == "resources/list":
-        return reply({"resources": []})
-    if method == "prompts/list":
-        return reply({"prompts": []})
-    if method == "tools/call":
+    elif method == "tools/list":
+        response_data = reply({"tools": [tool.as_dict() for tool in TOOLS]})
+    elif method == "resources/list":
+        response_data = reply({"resources": []})
+    elif method == "prompts/list":
+        response_data = reply({"prompts": []})
+    elif method == "tools/call":
         params = body.get("params", {}) or {}
         name = params.get("name")
         args = params.get("arguments", {}) or {}
         tool = next((t for t in TOOLS if t.name == name), None)
         if tool is None:
-            return reply(error={"code": -32601, "message": f"Unknown tool: {name}"})
-        try:
-            result = await tool.run(**args)
-            return reply(result=result)
-        except HTTPException as http_exc:
-            return reply(error={"code": -32000, "message": http_exc.detail})
-        except Exception as exc:
-            return reply(error={"code": -32603, "message": str(exc)})
-    return reply(error={"code": -32601, "message": f"Method not found: {method}"})
+            response_data = reply(error={"code": -32601, "message": f"Unknown tool: {name}"})
+        else:
+            try:
+                result = await tool.run(**args)
+                response_data = reply(result=result)
+            except HTTPException as http_exc:
+                response_data = reply(error={"code": -32000, "message": http_exc.detail})
+            except Exception as exc:
+                response_data = reply(error={"code": -32603, "message": str(exc)})
+    else:
+        response_data = reply(error={"code": -32601, "message": f"Method not found: {method}"})
+    
+    # Return as Server-Sent Events (SSE) format
+    async def event_generator():
+        yield {
+            "event": "message",
+            "data": json.dumps(response_data, ensure_ascii=False)
+        }
+    
+    return EventSourceResponse(event_generator())

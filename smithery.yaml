@@ -1,41 +1,30 @@
 # Smithery configuration file for the ETF MCP server.
-
 # This file tells Smithery how to build and run your Model-Context-Protocol (MCP)
 # server. It includes metadata such as the name, version and description of
 # the server, build instructions, and the start command.
 
-name: "@Xxx00xxX33/etf_mcp"
+name: etf-mcp
 version: "0.1.0"
-description: "Chinese A-Share ETF data MCP using TuShare API and FastAPI."
-author:
-  name: "Xxx00xxX33"
-  email: "your-email@example.com"
-license: "MIT"
-keywords: [etf, tushare, finance, mcp-server]
+description: "Chinese A-Share ETF data MCP using TuShare API and FastAPI"
 
+runtime: "container"
 
 build:
-  dockerfile: Dockerfile
+  dockerfile: "Dockerfile"
   dockerBuildPath: "."
 
 startCommand:
-  type: http
+  type: "http"
   configSchema:
-    type: object
+    type: "object"
     properties:
       TUSHARE_TOKEN:
-        type: string
-        title: "TuShare API Token (Optional)"
-        description: "Optional default TuShare API token. Users can override this by providing their own token via the X-Tushare-Token header or Authorization: Bearer <token> when connecting."
-    required: []
-  commandFunction: |
-    (config) => ({
-      command: "uvicorn",
-      args: ["main:app", "--host", "0.0.0.0", "--port", "8000"],
-      env: {
-        "TUSHARE_TOKEN": config.TUSHARE_TOKEN || ""
-      }
-    })
+        type: "string"
+        title: "TuShare API Token"
+        description: "Your TuShare Pro API token from https://tushare.pro/user/token"
+    required: ["TUSHARE_TOKEN"]
+  exampleConfig:
+    TUSHARE_TOKEN: "your_token_here"
 
-exampleConfig:
-  TUSHARE_TOKEN: ""
+env:
+  PYTHONUNBUFFERED: "1"
