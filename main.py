@@ -347,8 +347,8 @@ async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, e
     return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
 
 
-async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E") -> dict:
-    """MCP tool: Calculate interval performance for all ETFs."""
+async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E", limit: int = 20) -> dict:
+    """MCP tool: Calculate interval performance for ETFs (limited to avoid timeout)."""
     pro = get_pro()
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
@@ -357,7 +357,7 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
         # Run blocking Tushare call in thread pool with timeout
         df_list: DataFrame = await asyncio.wait_for(
             asyncio.to_thread(pro.fund_basic, market=market),
-            timeout=30.0
+            timeout=15.0
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
@@ -366,9 +366,19 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
     
     funds = df_list_to_rows(df_list, ["ts_code", "name"])
     results: List[dict] = []
+    total_funds = len(funds)
+    funds_to_process = funds[:limit]  # Limit number of ETFs to process
     
+    
+    import time
+    start_time = time.time()
+    max_duration = 50  # Maximum 50 seconds for all processing
     for fund in funds:
         code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
+        # Check overall timeout
+        if time.time() - start_time > max_duration:
+            break
+            
         name = fund.get("name") or fund.get("fund_name")
         if not code:
             continue
@@ -376,7 +386,7 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
             # Run blocking Tushare call in thread pool with timeout
             nav_df: DataFrame = await asyncio.wait_for(
                 asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end),
-                timeout=30.0
+                timeout=10.0
             )
         except asyncio.TimeoutError:
             results.append({"ts_code": code, "name": name, "error": "Request timed out"})
@@ -420,7 +430,22 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
         # Yield control to event loop
         await asyncio.sleep(0)
     
-    return {"content": [{"type": "text", "text": json.dumps(results, ensure_ascii=False, indent=2)}]}
+    # Add informative note
+    elapsed_time = time.time() - start_time
+    note = f"Returned {len(results)} ETFs"
+    if len(results) < total_funds:
+        note += f" (limited from {total_funds} total ETFs to avoid timeout)"
+    if elapsed_time > max_duration:
+        note += f" (stopped after {max_duration}s timeout)"
+    note += f". Processing time: {elapsed_time:.1f}s"
+    
+    response_text = json.dumps(results, ensure_ascii=False, indent=2)
+    return {
+        "content": [
+            {"type": "text", "text": response_text},
+            {"type": "text", "text": f"\n\nNote: {note}"}
+        ]
+    }
 
 
 TOOLS: List[Tool] = [
@@ -488,7 +513,7 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="get_etf_performance",
-        description="Calculate interval performance (percentage change) for all ETFs between two dates.",
+        description="Calculate interval performance (percentage change) for ETFs between two dates. Limited to avoid timeout.",
         input_schema={
             "type": "object",
             "properties": {
@@ -504,6 +529,11 @@ TOOLS: List[Tool] = [
                     "type": "string",
                     "description": "Market code to filter ETF types (default 'E')",
                     "default": "E",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of ETFs to process (default 20 to avoid timeout)",
+                    "default": 20,
                 },
             },
             "required": ["start_date", "end_date"],
