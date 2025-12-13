@@ -568,44 +568,90 @@ def is_a_share_etf(code: str, name: str) -> bool:
 
 async def _get_day_top_etfs(limit: int) -> list:
     """
-    使用 AkShare 获取当日涨幅排行前 N 的 ETF（快速）
+    使用 Tushare 获取当日涨幅排行前 N 的 ETF
+    注意：由于 AkShare fund_etf_spot_em 接口不稳定，改用 Tushare 实现
     """
-    if ak is None:
-        raise HTTPException(
-            status_code=500,
-            detail="The 'akshare' library is not installed. Please install it via requirements.txt."
-        )
+    pro = get_pro()
     
     try:
-        # 在线程池中执行，避免阻塞事件循环
-        df = await asyncio.wait_for(
-            asyncio.to_thread(ak.fund_etf_spot_em),
-            timeout=10.0
+        # 1. 获取今日日期
+        today = datetime.now().strftime('%Y%m%d')
+        
+        # 2. 获取 ETF 列表
+        funds_df = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_basic, market='E'),
+            timeout=15.0
         )
         
-        # 过滤掉港股ETF和海外ETF
-        df_filtered = df[df.apply(lambda row: is_a_share_etf(str(row['代码']), str(row['名称'])), axis=1)]
+        if funds_df.empty:
+            return []
         
-        # 按涨跌幅降序排序
-        df_sorted = df_filtered.sort_values(by='涨跌幅', ascending=False)
+        # 3. 过滤A股ETF
+        funds_filtered = funds_df[funds_df.apply(
+            lambda row: is_a_share_etf(str(row['ts_code'])[:6], str(row['name'])),
+            axis=1
+        )]
         
-        # 取前 N 个
-        top_n = df_sorted.head(limit)
+        # 4. 获取今日和昨日的净值数据，计算涨跌幅
+        results = []
         
-        # 转换为字典列表
-        results = top_n.to_dict(orient='records')
+        # 为了提高效率，只处理 limit * 3 个 ETF
+        funds_to_process = funds_filtered.head(limit * 3)
         
-        return results
+        for _, fund in funds_to_process.iterrows():
+            try:
+                # 获取最近 5 天的数据（确保有今日和昨日）
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=5)
+                
+                nav_df = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        pro.fund_nav,
+                        ts_code=fund['ts_code'],
+                        start_date=start_date.strftime('%Y%m%d'),
+                        end_date=end_date.strftime('%Y%m%d')
+                    ),
+                    timeout=8.0
+                )
+                
+                if not nav_df.empty and len(nav_df) >= 2:
+                    # 按日期排序
+                    nav_df_sorted = nav_df.sort_values(by='nav_date', ascending=False)
+                    
+                    # 计算涨跌幅：(今日 - 昨日) / 昨日 * 100
+                    if len(nav_df_sorted) >= 2:
+                        today_nav = nav_df_sorted.iloc[0]['unit_nav']
+                        yesterday_nav = nav_df_sorted.iloc[1]['unit_nav']
+                        
+                        if today_nav and yesterday_nav and yesterday_nav > 0:
+                            pct_change = (today_nav - yesterday_nav) / yesterday_nav * 100
+                            
+                            results.append({
+                                'ts_code': fund['ts_code'],
+                                'name': fund['name'],
+                                'latest_nav': float(today_nav),
+                                'pct_change': round(float(pct_change), 2),
+                                'nav_date': nav_df_sorted.iloc[0]['nav_date']
+                            })
+            
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                continue
+        
+        # 5. 按涨跌幅排序并返回前 N 个
+        results_sorted = sorted(results, key=lambda x: x['pct_change'], reverse=True)
+        return results_sorted[:limit]
         
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=504,
-            detail="AkShare API request timed out after 10 seconds"
+            detail="Tushare API request timed out"
         )
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"AkShare API error: {exc}"
+            detail=f"Tushare API error: {exc}"
         )
 
 
