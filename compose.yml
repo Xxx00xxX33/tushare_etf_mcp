@@ -1,0 +1,12 @@
+services:
+  tushare_etf_mcp:
+    container_name: mcp_tushare_etf_mcp
+    build:
+      context: .
+    env_file:
+      - /etc/tushare-etf-mcp.env
+    environment:
+      - PORT=8000
+    ports:
+      - "127.0.0.1:8830:8000"
+    restart: unless-stopped

@@ -1,0 +1,16 @@
+[Unit]
+Description=TuShare ETF MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tushare_etf_mcp
+Environment=TUSHARE_TOKEN=请在此处填入您的真实令牌
+Environment=PORT=8082
+ExecStart=/bin/bash -c 'source /opt/tushare_etf_mcp/venv/bin/activate && exec uvicorn main:app --host 0.0.0.0 --port 8082 --log-level info'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

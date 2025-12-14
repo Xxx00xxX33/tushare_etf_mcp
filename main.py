@@ -12,13 +12,16 @@ from sse_starlette.sse import EventSourceResponse
 try:
     import tushare as ts  # type: ignore
     from pandas import DataFrame  # type: ignore
-    import akshare as ak  # type: ignore
-except Exception:
-    # We defer ImportError until runtime; see get_pro() below
+except ImportError as e:
+    # Only set ts to None if tushare import fails
     ts = None  # type: ignore
     DataFrame = None  # type: ignore
-    ak = None  # type: ignore
 
+# Import akshare separately (optional)
+try:
+    import akshare as ak  # type: ignore
+except ImportError:
+    ak = None  # type: ignore
 
 app = FastAPI(
     title="ETF MCP Server",
@@ -30,6 +33,34 @@ app = FastAPI(
 )
 
 
+
+# Cache for fund_basic results with 5-minute expiry
+_fund_basic_cache = {}
+_cache_expiry = 300  # seconds
+
+async def get_fund_basic_with_cache(market: str = "E"):
+    """Get fund basic data with caching to reduce API calls."""
+    import time
+    cache_key = f"fund_basic_{market}"
+    current_time = time.time()
+    if cache_key in _fund_basic_cache:
+        data, timestamp = _fund_basic_cache[cache_key]
+        if current_time - timestamp < _cache_expiry:
+            return data
+    
+    # Not in cache or expired, fetch fresh data
+    pro = get_pro()
+    df_list = await asyncio.to_thread(pro.fund_basic, market=market)
+    _fund_basic_cache[cache_key] = (df_list, current_time)
+    return df_list
+
+# Semaphore to limit concurrent API calls
+_fund_nav_semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent calls
+
+async def get_fund_nav_with_semaphore(pro, ts_code, start_date, end_date):
+    """Get fund NAV data with concurrency control."""
+    async with _fund_nav_semaphore:
+        return await asyncio.to_thread(pro.fund_nav, ts_code=ts_code, start_date=start_date, end_date=end_date)
 def get_pro():
     """Initialise and return a TuShare pro_api client.
 
@@ -349,63 +380,87 @@ async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, e
     return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
 
 
-async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E", limit: int = 20) -> dict:
-    """MCP tool: Calculate interval performance for ETFs (limited to avoid timeout)."""
-    pro = get_pro()
+async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E", limit: int = 5) -> dict:
+    """MCP tool: Calculate interval performance for ETFs with caching and concurrency control."""
+    import time
+    start_time = time.time()
+    max_total_duration = 55  # Maximum 55 seconds for the whole function
+    
+    # Format dates
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
     
+    # 1. Get fund list with cache
     try:
-        # Run blocking Tushare call in thread pool with timeout
         df_list: DataFrame = await asyncio.wait_for(
-            asyncio.to_thread(pro.fund_basic, market=market),
-            timeout=15.0
+            get_fund_basic_with_cache(market),
+            timeout=20.0
         )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
+        raise HTTPException(status_code=504, detail="TuShare fund_basic request timed out after 20 seconds")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
     funds = df_list_to_rows(df_list, ["ts_code", "name"])
-    results: List[dict] = []
     total_funds = len(funds)
-    funds_to_process = funds[:limit]  # Limit number of ETFs to process
     
+    # Enforce a reasonable limit to prevent excessive processing
+    if limit > 50:
+        limit = 50  # Cap at 50 ETFs maximum
+    funds_to_process = funds[:limit]
     
-    import time
-    start_time = time.time()
-    max_duration = 50  # Maximum 50 seconds for all processing
-    for fund in funds:
-        code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
+    # If there are more funds than we can process in time, further limit
+    if total_funds > limit:
+        # Already limited
+        pass
+    
+    results: List[dict] = []
+    processed = 0
+    skipped = 0
+    errors = 0
+    
+    # Process each fund with individual timeouts and concurrency control
+    for fund in funds_to_process:
         # Check overall timeout
-        if time.time() - start_time > max_duration:
+        if time.time() - start_time > max_total_duration:
             break
             
+        code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
         name = fund.get("name") or fund.get("fund_name")
         if not code:
+            skipped += 1
             continue
+        
+        processed += 1
+        
         try:
-            # Run blocking Tushare call in thread pool with timeout
+            # Use semaphore-controlled NAV request with timeout
+            pro = get_pro()
             nav_df: DataFrame = await asyncio.wait_for(
-                asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end),
-                timeout=10.0
+                get_fund_nav_with_semaphore(pro, code, start, end),
+                timeout=8.0
             )
         except asyncio.TimeoutError:
             results.append({"ts_code": code, "name": name, "error": "Request timed out"})
+            errors += 1
             continue
         except Exception as exc:
             results.append({"ts_code": code, "name": name, "error": str(exc)})
+            errors += 1
             continue
         
         if nav_df.empty or len(nav_df.index) < 2:
+            skipped += 1
             continue
         
+        # Identify price column
         price_col: Optional[str] = None
         for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
             if candidate in nav_df.columns:
                 price_col = candidate
                 break
         if price_col is None:
+            skipped += 1
             continue
         
         start_price = nav_df.iloc[0][price_col]
@@ -414,9 +469,11 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
             start_float = float(start_price)
             end_float = float(end_price)
         except Exception:
+            skipped += 1
             continue
         
         if start_float == 0:
+            skipped += 1
             continue
         
         change = (end_float - start_float) / start_float * 100
@@ -424,33 +481,31 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
             {
                 "ts_code": code,
                 "name": name,
-                "start_price": start_float,
-                "end_price": end_float,
+                "start_price": round(start_float, 4),
+                "end_price": round(end_float, 4),
                 "change_pct": round(change, 2),
             }
         )
         # Yield control to event loop
         await asyncio.sleep(0)
     
-    # Add informative note
+    # Build response
     elapsed_time = time.time() - start_time
     note = f"Returned {len(results)} ETFs"
-    if len(results) < total_funds:
-        note += f" (limited from {total_funds} total ETFs to avoid timeout)"
-    if elapsed_time > max_duration:
-        note += f" (stopped after {max_duration}s timeout)"
+    note += f" (processed {processed}, skipped {skipped}, errors {errors})"
+    if total_funds > len(funds_to_process):
+        note += f". Limited from {total_funds} total ETFs to {limit} for performance"
+    if elapsed_time > max_total_duration - 5:
+        note += f" (stopped after {max_total_duration}s timeout)"
     note += f". Processing time: {elapsed_time:.1f}s"
     
     response_text = json.dumps(results, ensure_ascii=False, indent=2)
     return {
         "content": [
             {"type": "text", "text": response_text},
-            {"type": "text", "text": f"\n\nNote: {note}"}
+            {"type": "text", "text": f"Note: {note}"}
         ]
     }
-
-import time
-
 async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, market: str = "E") -> dict:
     """
     获取指定时间周期内涨幅排行前 N 的 ETF
