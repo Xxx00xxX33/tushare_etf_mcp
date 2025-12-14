@@ -693,53 +693,38 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
     }
 
 
-async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, market: str = "E") -> dict:
+async def tool_top_etfs_by_period() -> dict:
     """
-    获取指定时间周期内涨幅排行前 N 的 ETF
-    
-    Args:
-        period: 时间周期，"week"=近一周涨幅, "month"=近一月涨幅
-        limit: 返回数量，默认 10
-        market: 市场类型，"E"=ETF, "O"=LOF
+    获取最近 5 个交易日涨幅前 3 的 A 股股票型 ETF
     
     Returns:
-        MCP 格式的响应，包含涨幅排行前 N 的 ETF
+        MCP 格式的响应，包含最近 5 个交易日涨幅排行前 3 的股票型 ETF
     """
-    logger.info(f"Tool call: top_etfs_by_period with period: {period}, limit: {limit}, market: {market}")
+    logger.info(f"Tool call: top_etfs_by_period (最近5个交易日涨幅前3)")
     start_time = time.time()
     
     try:
-        if period == "week":
-            # 使用 Tushare 计算近一周涨幅
-            results = await _get_period_top_etfs(days=7, limit=limit, market=market)
-            period_desc = "近一周"
-        elif period == "month":
-            # 使用 Tushare 计算近一月涨幅
-            results = await _get_period_top_etfs(days=30, limit=limit, market=market)
-            period_desc = "近一月"
-        else:
-            logger.error(f"Tool top_etfs_by_period: Invalid period: {period}.")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid period: {period}. Must be one of: week, month"
-            )
+        # 固定参数：最近5个交易日，返回前3名
+        results = await _get_recent_trading_days_top_etfs(trading_days=5, limit=3)
         
         elapsed = time.time() - start_time
         logger.info(f"Tool top_etfs_by_period finished. Elapsed time: {elapsed:.1f}s")
         
         # 格式化输出
-        output_lines = [f"{period_desc}涨幅前 {len(results)} 的 ETF：\n\n"]
+        output_lines = [f"最近 5 个交易日涨幅前 3 的 A 股股票型 ETF：\n\n"]
         
         for i, etf in enumerate(results, 1):
             line = (
                 f"{i}. {etf['name']} ({etf['ts_code']})\n"
-                f"   {period_desc}涨幅: {etf['gain']:.2f}%\n"
+                f"   5日涨幅: {etf['gain']:.2f}%\n"
+                f"   起始净值: {etf['start_nav']:.4f} ({etf['start_date']})\n"
+                f"   最新净值: {etf['end_nav']:.4f} ({etf['end_date']})\n"
             )
             output_lines.append(line)
         
         output_lines.append(f"\n处理时间: {elapsed:.1f} 秒")
         
-        if len(results) < limit:
+        if len(results) < 3:
             output_lines.append(
                 f"\n注意: 仅返回 {len(results)} 个 ETF（部分 ETF 数据不足或获取失败）"
             )
@@ -752,16 +737,16 @@ async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, mark
         }
         
     except asyncio.TimeoutError:
-        logger.error(f"Tool top_etfs_by_period: Request timed out while fetching {period} ETF performance data.")
+        logger.error(f"Tool top_etfs_by_period: Request timed out.")
         raise HTTPException(
             status_code=504,
-            detail=f"Request timed out while fetching {period} ETF performance data"
+            detail=f"Request timed out while fetching recent trading days ETF performance data"
         )
     except Exception as exc:
-        logger.error(f"Tool top_etfs_by_period: Error fetching {period} ETF performance: {exc}")
+        logger.error(f"Tool top_etfs_by_period: Error: {exc}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error fetching {period} ETF performance: {exc}"
+            detail=f"Error fetching recent trading days ETF performance: {exc}"
         )
 
 
@@ -807,6 +792,195 @@ def is_a_share_etf(code: str, name: str) -> bool:
     
     # 其他情况默认保留（谨慎起见）
     logger.debug(f"is_a_share_etf: Included {code} (default - no specific exclusion/inclusion met).")
+    return True
+
+async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> list:
+    """
+    获取最近 N 个交易日涨幅排行前 M 的 A 股股票型 ETF
+    
+    Args:
+        trading_days: 交易日数量（例如 5）
+        limit: 返回数量（例如 3）
+    
+    Returns:
+        涨幅排行列表
+    """
+    logger.info(f"Calling _get_recent_trading_days_top_etfs for {trading_days} trading days, limit {limit}")
+    pro = get_pro()
+    
+    try:
+        # 1. 获取交易日历，找到最近 N 个交易日
+        # 获取最近 30 天的交易日历（确保能覆盖到足够的交易日）
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=30)
+        
+        start_date_str = start_date.strftime('%Y%m%d')
+        end_date_str = end_date.strftime('%Y%m%d')
+        
+        # 获取交易日历
+        trade_cal_df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(pro.trade_cal, exchange='SSE', start_date=start_date_str, end_date=end_date_str),
+            timeout=10.0
+        )
+        logger.info(f"Trade calendar retrieved: {len(trade_cal_df)} days")
+        
+        # 筛选出交易日（is_open=1）
+        trading_days_df = trade_cal_df[trade_cal_df['is_open'] == 1].sort_values('cal_date', ascending=False)
+        
+        if len(trading_days_df) < trading_days:
+            logger.warning(f"Not enough trading days found: {len(trading_days_df)} < {trading_days}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Not enough trading days found: {len(trading_days_df)} < {trading_days}"
+            )
+        
+        # 获取最近 N 个交易日
+        recent_trading_days = trading_days_df.head(trading_days)
+        latest_trading_day = recent_trading_days.iloc[0]['cal_date']
+        earliest_trading_day = recent_trading_days.iloc[-1]['cal_date']
+        
+        logger.info(f"Recent {trading_days} trading days: {earliest_trading_day} to {latest_trading_day}")
+        
+        # 2. 获取 A 股股票型 ETF 列表
+        funds_df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(pro.fund_basic, market='E'),
+            timeout=15.0
+        )
+        logger.info(f"fund_basic call successful, returned {len(funds_df)} ETFs")
+        
+        if funds_df.empty:
+            logger.info("funds_df is empty, returning empty list")
+            return []
+        
+        # 3. 过滤 A 股股票型 ETF
+        if pd_isna is None:
+            logger.error("pandas isna function not available")
+            raise HTTPException(status_code=500, detail="pandas isna function not available")
+        
+        # 先过滤 A 股 ETF
+        funds_filtered = funds_df[funds_df.apply(
+            lambda row: is_a_share_etf(
+                str(row['ts_code']) if not pd_isna(row['ts_code']) else '',
+                str(row['name']) if not pd_isna(row['name']) else ''
+            ),
+            axis=1
+        )]
+        logger.info(f"After A-share filtering: {len(funds_filtered)} ETFs")
+        
+        # 再过滤股票型 ETF
+        funds_filtered = funds_filtered[funds_filtered.apply(
+            lambda row: is_stock_etf(
+                str(row['name']) if not pd_isna(row['name']) else ''
+            ),
+            axis=1
+        )]
+        logger.info(f"After stock-type filtering: {len(funds_filtered)} ETFs")
+        
+        # 4. 限制处理数量（处理更多以确保有足够的有效数据）
+        funds_to_process = funds_filtered.head(limit * 10)
+        logger.info(f"Processing {len(funds_to_process)} ETFs to get top {limit}")
+        
+        # 5. 计算每个 ETF 在最近 N 个交易日的涨幅
+        results = []
+        overall_start = time.time()
+        
+        for _, fund in funds_to_process.iterrows():
+            # 整体超时保护
+            if time.time() - overall_start > 50:
+                logger.warning("Overall timeout exceeded, breaking loop")
+                break
+            
+            try:
+                nav_df: DataFrame = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        pro.fund_nav,
+                        ts_code=fund['ts_code'],
+                        start_date=earliest_trading_day,
+                        end_date=latest_trading_day
+                    ),
+                    timeout=10.0
+                )
+                
+                if not nav_df.empty and len(nav_df) >= 2:
+                    # 按日期排序
+                    nav_df_sorted = nav_df.sort_values(by='nav_date')
+                    
+                    # 检查 unit_nav 列
+                    if 'unit_nav' not in nav_df_sorted.columns or nav_df_sorted['unit_nav'].isnull().all():
+                        logger.warning(f"Skipping {fund['ts_code']}: 'unit_nav' column missing or all NaN")
+                        continue
+                    
+                    # 获取起始和结束净值
+                    start_nav = nav_df_sorted.iloc[0]['unit_nav']
+                    end_nav = nav_df_sorted.iloc[-1]['unit_nav']
+                    start_date_val = nav_df_sorted.iloc[0]['nav_date']
+                    end_date_val = nav_df_sorted.iloc[-1]['nav_date']
+                    
+                    if start_nav is not None and end_nav is not None and start_nav > 0:
+                        gain = (end_nav - start_nav) / start_nav * 100
+                        
+                        results.append({
+                            'ts_code': fund['ts_code'],
+                            'name': fund['name'],
+                            'gain': gain,
+                            'start_nav': start_nav,
+                            'end_nav': end_nav,
+                            'start_date': start_date_val,
+                            'end_date': end_date_val
+                        })
+                        logger.debug(f"{fund['ts_code']} {fund['name']}: {gain:.2f}%")
+                
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout for {fund['ts_code']}, skipping")
+                continue
+            except Exception as e:
+                logger.warning(f"Error processing {fund['ts_code']}: {e}")
+                continue
+        
+        # 6. 按涨幅降序排序并取前 N 个
+        results_sorted = sorted(results, key=lambda x: x['gain'], reverse=True)
+        top_results = results_sorted[:limit]
+        
+        logger.info(f"Returning top {len(top_results)} ETFs")
+        return top_results
+        
+    except asyncio.TimeoutError:
+        logger.error("TuShare API request timed out")
+        raise HTTPException(
+            status_code=504,
+            detail="TuShare API request timed out while fetching trading calendar or ETF list"
+        )
+    except Exception as exc:
+        logger.error(f"Error in _get_recent_trading_days_top_etfs: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"TuShare API error: {exc}"
+        )
+
+
+def is_stock_etf(name: str) -> bool:
+    """
+    判断是否为股票型 ETF（排除债券、货币、黄金等其他类型）
+    
+    Args:
+        name: ETF名称
+    
+    Returns:
+        True if 股票型ETF, False otherwise
+    """
+    # 排除条件：名称中包含非股票型关键词
+    exclude_keywords = [
+        '债', '债券', 
+        '货币', '理财',
+        '黄金', '白银', '商品',
+        'REITS', 'REITs', '房地产',
+        '可转债', '转债'
+    ]
+    
+    if any(keyword in name for keyword in exclude_keywords):
+        return False
+    
+    # 保留条件：包含股票型关键词或不包含排除关键词的默认为股票型
     return True
 
 
@@ -1047,29 +1221,10 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="get_top_etfs_by_period",
-        description="Get top N A-share ETFs by gain/loss for a specific time period (week/month). Only returns ETFs with A-share components, excluding Hong Kong and overseas ETFs.",
+        description="获取最近 5 个交易日涨幅前 3 的 A 股股票型 ETF。自动排除休市日（节假日、周末），仅计算实际交易日的涨幅。仅返回 A 股股票型 ETF，排除港股、海外、债券、货币等类型。",
         input_schema={
             "type": "object",
-            "properties": {
-                "period": {
-                    "type": "string",
-                    "description": "Time period: 'week' for weekly gain, 'month' for monthly gain",
-                    "enum": ["week", "month"],
-                    "default": "week",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of top ETFs to return (default 10)",
-                    "default": 10,
-                    "minimum": 1,
-                    "maximum": 50,
-                },
-                "market": {
-                    "type": "string",
-                    "description": "Market code: 'E' for ETF, 'O' for LOF (default 'E')",
-                    "default": "E",
-                },
-            },
+            "properties": {},
             "required": [],
         },
         run=tool_top_etfs_by_period,
