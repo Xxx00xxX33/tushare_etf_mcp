@@ -1,0 +1,66 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main # 当推送到 main 分支时触发
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # 确保拉取完整历史记录，用于 git log
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+
+    - name: Deploy to VPS
+      run: |
+        # 设置Git用户名和邮箱用于commit message
+        git config --global user.name "Xxx00xxX33"
+        git config --global user.email "xxx00xxx33@example.com" # 请替换为实际的邮箱
+
+        echo "Connecting to VPS: ${{ secrets.VPS_USERNAME }}@${{ secrets.VPS_HOST }}"
+        ssh -o StrictHostKeyChecking=no ${{ secrets.VPS_USERNAME }}@${{ secrets.VPS_HOST }} << 'EOF'
+          set -e # 任何命令失败立即退出
+
+          echo "开始部署 Tushare ETF MCP 服务..."
+
+          cd /opt/tushare_etf_mcp
+
+          echo "1. 拉取最新代码..."
+          git pull
+
+          echo "2. 停止并删除旧容器..."
+          docker rm -f $(docker ps -qa --filter name=mcp_tushare_etf_mcp) || true
+
+          echo "3. 删除旧镜像..."
+          docker rmi $(docker images -qa --filter reference=tushare_etf_mcp-tushare_etf_mcp) || true
+
+          echo "4. 重新构建 Docker 镜像..."
+          docker compose build
+
+          echo "5. 启动新的 Docker 容器..."
+          docker compose up -d
+
+          echo "6. 执行健康检查..."
+          status_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8830/health)
+          if [ "$status_code" -eq 200 ]; then
+            echo "健康检查成功，服务已正常运行。"
+          else
+            echo "健康检查失败，HTTP 状态码: $status_code"
+            exit 1 # 健康检查失败则退出
+          fi
+
+          echo "部署完成！"
+        EOF
+
+      env:
+        # 传递环境变量到 VPS 上的 Docker Compose
+        DOCKER_BUILDKIT: 1 # 启用 Docker BuildKit
