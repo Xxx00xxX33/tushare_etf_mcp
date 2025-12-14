@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import AsyncGenerator, Callable, Iterable, List, Optional
 from functools import partial
@@ -9,19 +10,44 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from sse_starlette.sse import EventSourceResponse
 
-try:
-    import tushare as ts  # type: ignore
-    from pandas import DataFrame  # type: ignore
-except ImportError as e:
-    # Only set ts to None if tushare import fails
-    ts = None  # type: ignore
-    DataFrame = None  # type: ignore
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Import akshare separately (optional)
+# Use more specific ImportError to avoid catching unrelated exceptions
+ts = None
+DataFrame = None
+pd_isna = None
+ak = None
+
 try:
-    import akshare as ak  # type: ignore
+    import tushare as ts_module
+    ts = ts_module
+    logger.info("tushare library imported successfully.")
 except ImportError:
-    ak = None  # type: ignore
+    logger.error("tushare library not found.")
+except Exception as e:
+    logger.error(f"Error importing tushare: {e}")
+
+try:
+    from pandas import DataFrame as pd_DataFrame, isna as pd_isna_func
+    DataFrame = pd_DataFrame
+    pd_isna = pd_isna_func
+    logger.info("pandas library imported successfully.")
+except ImportError:
+    logger.error("pandas library not found.")
+except Exception as e:
+    logger.error(f"Error importing pandas: {e}")
+
+try:
+    import akshare as ak_module
+    ak = ak_module
+    logger.info("akshare library imported successfully.")
+except ImportError:
+    logger.info("akshare library not found (optional).") # akshare is optional
+except Exception as e:
+    logger.error(f"Error importing akshare: {e}")
+
 
 app = FastAPI(
     title="ETF MCP Server",
@@ -33,34 +59,6 @@ app = FastAPI(
 )
 
 
-
-# Cache for fund_basic results with 5-minute expiry
-_fund_basic_cache = {}
-_cache_expiry = 300  # seconds
-
-async def get_fund_basic_with_cache(market: str = "E"):
-    """Get fund basic data with caching to reduce API calls."""
-    import time
-    cache_key = f"fund_basic_{market}"
-    current_time = time.time()
-    if cache_key in _fund_basic_cache:
-        data, timestamp = _fund_basic_cache[cache_key]
-        if current_time - timestamp < _cache_expiry:
-            return data
-    
-    # Not in cache or expired, fetch fresh data
-    pro = get_pro()
-    df_list = await asyncio.to_thread(pro.fund_basic, market=market)
-    _fund_basic_cache[cache_key] = (df_list, current_time)
-    return df_list
-
-# Semaphore to limit concurrent API calls
-_fund_nav_semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent calls
-
-async def get_fund_nav_with_semaphore(pro, ts_code, start_date, end_date):
-    """Get fund NAV data with concurrency control."""
-    async with _fund_nav_semaphore:
-        return await asyncio.to_thread(pro.fund_nav, ts_code=ts_code, start_date=start_date, end_date=end_date)
 def get_pro():
     """Initialise and return a TuShare pro_api client.
 
@@ -68,23 +66,41 @@ def get_pro():
     variable.  If the module is not installed or the token is missing the
     caller receives a HTTP 500/400 error accordingly.
     """
+    logger.info("Attempting to get Tushare pro_api client.")
     if ts is None:
+        logger.error("tushare library is None in get_pro().")
         raise HTTPException(
             status_code=500,
             detail="The 'tushare' library is not installed. Please install it via requirements.txt.",
         )
     token = os.getenv("TUSHARE_TOKEN")
     if not token:
+        logger.error("TUSHARE_TOKEN environment variable is not set.")
         raise HTTPException(
             status_code=500,
             detail="TUSHARE_TOKEN environment variable is not set. Please provide your TuShare API token.",
         )
-    # Only set token once per process
+    logger.info(f"TUSHARE_TOKEN retrieved: {token is not None}")
+    
+    # Ensure token is set before calling pro_api
+    if not getattr(ts, "_token_set", False):
+        try:
+            ts.set_token(token)
+            setattr(ts, "_token_set", True)
+            logger.info("Tushare token set successfully.")
+        except Exception as e:
+            logger.error(f"Error setting Tushare token: {e}")
+            raise HTTPException(status_code=500, detail=f"Error setting Tushare token: {e}")
+    
+    # Only set client once per process
     if not hasattr(get_pro, "_client"):
-        ts.set_token(token)
-        setattr(get_pro, "_client", ts.pro_api())
+        try:
+            setattr(get_pro, "_client", ts.pro_api())
+            logger.info("Tushare pro_api client initialized successfully.")
+        except Exception as e:
+            logger.error(f"Error initializing Tushare pro_api: {e}")
+            raise HTTPException(status_code=500, detail=f"Error initializing Tushare pro_api: {e}")
     return getattr(get_pro, "_client")
-
 
 def df_to_dicts(df: "DataFrame") -> List[dict]:
     """Convert a pandas DataFrame into a list of dictionaries.
@@ -93,6 +109,14 @@ def df_to_dicts(df: "DataFrame") -> List[dict]:
     gracefully until actually needed.  The JSON conversion uses pandas'
     built‑in method for performance and consistent field names.
     """
+    if DataFrame is None:
+        logger.error("pandas DataFrame is None in df_to_dicts().")
+        raise HTTPException(
+            status_code=500,
+            detail="The 'pandas' library is not installed. Please install it via requirements.txt.",
+        )
+    if df.empty:
+        return []
     return df.to_dict(orient="records")
 
 
@@ -132,11 +156,14 @@ async def list_etfs(market: str = Query("E", description="Market code, default '
     selects ETF products.  Each row is emitted as a JSON object on its own
     line.  If the API call fails, a HTTPException is raised.
     """
+    logger.info(f"Received request for /etfs with market: {market}")
     pro = get_pro()
     try:
         # Run blocking Tushare call in thread pool
         df: DataFrame = await asyncio.to_thread(pro.fund_basic, market=market)
+        logger.info(f"fund_basic call successful, returned {len(df)} rows.")
     except Exception as exc:
+        logger.error(f"TuShare API error in /etfs: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     rows = df_to_dicts(df)
     return StreamingResponse(stream_json_lines(rows), media_type="application/x-ndjson")
@@ -155,6 +182,7 @@ async def etf_history(
     be supplied in either YYYY‑MM‑DD or YYYYMMDD format; hyphens are stripped
     before passing to TuShare.
     """
+    logger.info(f"Received request for /etf/{ts_code}/history from {start_date} to {end_date}")
     pro = get_pro()
 
     def normalise(value: Optional[str]) -> Optional[str]:
@@ -167,7 +195,9 @@ async def etf_history(
     try:
         # Run blocking Tushare call in thread pool
         df: DataFrame = await asyncio.to_thread(pro.fund_nav, ts_code=ts_code, start_date=start, end_date=end)
+        logger.info(f"fund_nav call for {ts_code} successful, returned {len(df)} rows.")
     except Exception as exc:
+        logger.error(f"TuShare API error in /etf/{ts_code}/history: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     rows = df_to_dicts(df)
     return StreamingResponse(stream_json_lines(rows), media_type="application/x-ndjson")
@@ -186,6 +216,7 @@ async def etf_holdings(
     be supplied in either YYYY‑MM‑DD or YYYYMMDD format; hyphens are stripped
     before passing to TuShare.
     """
+    logger.info(f"Received request for /etf/{ts_code}/holdings from {start_date} to {end_date}")
     pro = get_pro()
 
     def normalise(value: Optional[str]) -> Optional[str]:
@@ -198,7 +229,9 @@ async def etf_holdings(
     try:
         # Run blocking Tushare call in thread pool
         df: DataFrame = await asyncio.to_thread(pro.fund_portfolio, ts_code=ts_code, start_date=start, end_date=end)
+        logger.info(f"fund_portfolio call for {ts_code} successful, returned {len(df)} rows.")
     except Exception as exc:
+        logger.error(f"TuShare API error in /etf/{ts_code}/holdings: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     rows = df_to_dicts(df)
     return StreamingResponse(stream_json_lines(rows), media_type="application/x-ndjson")
@@ -209,6 +242,7 @@ async def etf_performance(
     start_date: str = Query(..., description="Start date in YYYY-MM-DD or YYYYMMDD format"),
     end_date: str = Query(..., description="End date in YYYY-MM-DD or YYYYMMDD format"),
     market: str = Query("E", description="Market code, default 'E' for ETFs"),
+    limit: int = Query(20, description="Maximum number of ETFs to process (default 20 to avoid timeout)")
 ) -> StreamingResponse:
     """Stream interval performance for all ETFs.
 
@@ -217,6 +251,7 @@ async def etf_performance(
     change from the first to the last available price.  Results are streamed
     as JSON lines.  Funds with insufficient data or errors are skipped.
     """
+    logger.info(f"Received request for /etf_performance from {start_date} to {end_date} for market: {market}, limit: {limit}")
     pro = get_pro()
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
@@ -224,65 +259,115 @@ async def etf_performance(
     try:
         # Run blocking Tushare call in thread pool
         df_list: DataFrame = await asyncio.to_thread(pro.fund_basic, market=market)
+        logger.info(f"fund_basic call for performance successful, returned {len(df_list)} funds.")
     except Exception as exc:
+        logger.error(f"TuShare API error in /etf_performance (fund_basic): {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
 
     funds = df_list_to_rows(df_list, ["ts_code", "name"])
-
-    async def generate_performance() -> AsyncGenerator[bytes, None]:
-        for fund in funds:
-            code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
-            name = fund.get("name") or fund.get("fund_name")
-            if not code:
-                continue
-            try:
-                # Run blocking Tushare call in thread pool
-                nav_df: DataFrame = await asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end)
-            except Exception as exc:
-                error_row = {"ts_code": code, "name": name, "error": str(exc)}
-                line = json.dumps(error_row, ensure_ascii=False) + "\n"
-                yield line.encode("utf-8")
-                continue
-
-            if nav_df.empty or len(nav_df.index) < 2:
-                continue
-
-            price_col: Optional[str] = None
-            for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
-                if candidate in nav_df.columns:
+    results: List[dict] = []
+    total_funds = len(funds)
+    funds_to_process = funds[:limit]  # Limit number of ETFs to process
+    
+    import time
+    start_time = time.time()
+    max_duration = 50  # Maximum 50 seconds for all processing
+    for fund in funds_to_process: # Only iterate over funds_to_process
+        code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
+        # Check overall timeout
+        if time.time() - start_time > max_duration:
+            logger.warning(f"Exceeded max_duration ({max_duration}s) in etf_performance, breaking loop.")
+            break
+            
+        name = fund.get("name") or fund.get("fund_name")
+        if not code:
+            logger.warning(f"Skipping fund due to missing code: {fund}")
+            continue
+        try:
+            # Run blocking Tushare call in thread pool with timeout
+            nav_df: DataFrame = await asyncio.wait_for(
+                asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end),
+                timeout=10.0
+            )
+            logger.debug(f"fund_nav call for {code} successful.")
+        except asyncio.TimeoutError:
+            logger.warning(f"TuShare API request for {code} timed out.")
+            results.append({"ts_code": code, "name": name, "error": "Request timed out"})
+            continue
+        except Exception as exc:
+            logger.error(f"TuShare API error for {code} in etf_performance: {exc}")
+            results.append({"ts_code": code, "name": name, "error": str(exc)})
+            continue
+        
+        if nav_df.empty or len(nav_df.index) < 2:
+            logger.info(f"Skipping {code}: insufficient NAV data.")
+            continue
+        
+        price_col: Optional[str] = None
+        for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
+            if candidate in nav_df.columns:
+                # Ensure the column is not entirely NaN before selecting
+                if pd_isna is not None and not pd_isna(nav_df[candidate]).all():
                     price_col = candidate
                     break
-            if price_col is None:
-                continue
-
-            start_price = nav_df.iloc[0][price_col]
-            end_price = nav_df.iloc[-1][price_col]
-            try:
-                start_float = float(start_price)
-                end_float = float(end_price)
-            except Exception:
-                continue
-
-            if start_float == 0:
-                continue
-
-            change = (end_float - start_float) / start_float * 100
-            result = {
+        if price_col is None:
+            logger.warning(f"Skipping {code}: no valid price column found or all values are NaN.")
+            continue
+        
+        start_price = nav_df.iloc[0][price_col]
+        end_price = nav_df.iloc[-1][price_col]
+        try:
+            start_float = float(start_price)
+            end_float = float(end_price)
+        except ValueError:
+            logger.warning(f"Skipping {code}: invalid price value encountered (not floatable).")
+            continue
+        
+        if start_float == 0:
+            logger.warning(f"Skipping {code}: start_price is zero.")
+            continue
+        
+        change = (end_float - start_float) / start_float * 100
+        results.append(
+            {
                 "ts_code": code,
                 "name": name,
                 "start_price": start_float,
                 "end_price": end_float,
                 "change_pct": round(change, 2),
             }
-            line = json.dumps(result, ensure_ascii=False) + "\n"
-            yield line.encode("utf-8")
-            await asyncio.sleep(0)
-
-    return StreamingResponse(generate_performance(), media_type="application/x-ndjson")
+        )
+        logger.debug(f"Calculated performance for {code}: {change:.2f}%")
+        # Yield control to event loop
+        await asyncio.sleep(0)
+    
+    # Add informative note
+    elapsed_time = time.time() - start_time
+    note = f"Returned {len(results)} ETFs"
+    if len(results) < total_funds:
+        note += f" (limited from {total_funds} total ETFs to avoid timeout)"
+    if elapsed_time > max_duration:
+        note += f" (stopped after {max_duration:.1f}s timeout)"
+    note += f". Processing time: {elapsed_time:.1f}s"
+    logger.info(f"etf_performance finished. {note}")
+    
+    response_text = json.dumps(results, ensure_ascii=False, indent=2)
+    return {
+        "content": [
+            {"type": "text", "text": response_text},
+            {"type": "text", "text": f"\n\nNote: {note}"}
+        ]
+    }
 
 
 def df_list_to_rows(df: "DataFrame", columns: List[str]) -> List[dict]:
     """Extract specific columns from a DataFrame and return as a list of dicts."""
+    if DataFrame is None:
+        logger.error("pandas DataFrame is None in df_list_to_rows().")
+        raise HTTPException(
+            status_code=500,
+            detail="The 'pandas' library is not installed. Please install it via requirements.txt.",
+        )
     if df.empty:
         return []
     available = [c for c in columns if c in df.columns]
@@ -312,6 +397,7 @@ class Tool:
 
 async def tool_list_etfs(*, market: str = "E") -> dict:
     """MCP tool: List all ETF funds."""
+    logger.info(f"Tool call: list_etfs with market: {market}")
     pro = get_pro()
     try:
         # Run blocking Tushare call in thread pool with timeout
@@ -319,9 +405,12 @@ async def tool_list_etfs(*, market: str = "E") -> dict:
             asyncio.to_thread(pro.fund_basic, market=market),
             timeout=30.0
         )
+        logger.info(f"Tool list_etfs: fund_basic call successful, returned {len(df)} rows.")
     except asyncio.TimeoutError:
+        logger.error("Tool list_etfs: TuShare API request timed out after 30 seconds.")
         raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
+        logger.error(f"Tool list_etfs: TuShare API error: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
     rows = df_to_dicts(df)
@@ -330,6 +419,7 @@ async def tool_list_etfs(*, market: str = "E") -> dict:
 
 async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
     """MCP tool: Get historical NAV data for an ETF."""
+    logger.info(f"Tool call: get_etf_history for {ts_code} from {start_date} to {end_date}")
     pro = get_pro()
 
     def normalise(value: Optional[str]) -> Optional[str]:
@@ -345,9 +435,12 @@ async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, en
             asyncio.to_thread(pro.fund_nav, ts_code=ts_code, start_date=start, end_date=end),
             timeout=30.0
         )
+        logger.info(f"Tool get_etf_history for {ts_code} successful, returned {len(df)} rows.")
     except asyncio.TimeoutError:
+        logger.error(f"Tool get_etf_history for {ts_code}: TuShare API request timed out after 30 seconds.")
         raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
+        logger.error(f"Tool get_etf_history for {ts_code}: TuShare API error: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
     rows = df_to_dicts(df)
@@ -356,6 +449,7 @@ async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, en
 
 async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
     """MCP tool: Get constituent holdings for an ETF."""
+    logger.info(f"Tool call: get_etf_holdings for {ts_code} from {start_date} to {end_date}")
     pro = get_pro()
 
     def normalise(value: Optional[str]) -> Optional[str]:
@@ -371,96 +465,88 @@ async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, e
             asyncio.to_thread(pro.fund_portfolio, ts_code=ts_code, start_date=start, end_date=end),
             timeout=30.0
         )
+        logger.info(f"Tool get_etf_holdings for {ts_code} successful, returned {len(df)} rows.")
     except asyncio.TimeoutError:
+        logger.error(f"Tool get_etf_holdings for {ts_code}: TuShare API request timed out after 30 seconds.")
         raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
+        logger.error(f"Tool get_etf_holdings for {ts_code}: TuShare API error: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
     rows = df_to_dicts(df)
     return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
 
 
-async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E", limit: int = 5) -> dict:
-    """MCP tool: Calculate interval performance for ETFs with caching and concurrency control."""
-    import time
-    start_time = time.time()
-    max_total_duration = 55  # Maximum 55 seconds for the whole function
-    
-    # Format dates
+async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E", limit: int = 20) -> dict:
+    """MCP tool: Calculate interval performance for ETFs (limited to avoid timeout)."""
+    logger.info(f"Tool call: get_etf_performance from {start_date} to {end_date} for market: {market}, limit: {limit}")
+    pro = get_pro()
     start = start_date.replace("-", "")
     end = end_date.replace("-", "")
     
-    # 1. Get fund list with cache
     try:
+        # Run blocking Tushare call in thread pool with timeout
         df_list: DataFrame = await asyncio.wait_for(
-            get_fund_basic_with_cache(market),
-            timeout=20.0
+            asyncio.to_thread(pro.fund_basic, market=market),
+            timeout=15.0
         )
+        logger.info(f"Tool get_etf_performance: fund_basic call successful, returned {len(df_list)} funds.")
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="TuShare fund_basic request timed out after 20 seconds")
+        logger.error("Tool get_etf_performance: fund_basic TuShare API request timed out after 15 seconds.")
+        raise HTTPException(status_code=504, detail="TuShare API request timed out after 30 seconds")
     except Exception as exc:
+        logger.error(f"Tool get_etf_performance: TuShare API error (fund_basic): {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
     funds = df_list_to_rows(df_list, ["ts_code", "name"])
-    total_funds = len(funds)
-    
-    # Enforce a reasonable limit to prevent excessive processing
-    if limit > 50:
-        limit = 50  # Cap at 50 ETFs maximum
-    funds_to_process = funds[:limit]
-    
-    # If there are more funds than we can process in time, further limit
-    if total_funds > limit:
-        # Already limited
-        pass
-    
     results: List[dict] = []
-    processed = 0
-    skipped = 0
-    errors = 0
+    total_funds = len(funds)
+    funds_to_process = funds[:limit]  # Limit number of ETFs to process
     
-    # Process each fund with individual timeouts and concurrency control
-    for fund in funds_to_process:
+    
+    import time
+    start_time = time.time()
+    max_duration = 50  # Maximum 50 seconds for all processing
+    for fund in funds_to_process: # Only iterate over funds_to_process
+        code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
         # Check overall timeout
-        if time.time() - start_time > max_total_duration:
+        if time.time() - start_time > max_duration:
+            logger.warning(f"Tool get_etf_performance: Exceeded max_duration ({max_duration}s), breaking loop.")
             break
             
-        code = fund.get("ts_code") or fund.get("code") or fund.get("fund_code")
         name = fund.get("name") or fund.get("fund_name")
         if not code:
-            skipped += 1
+            logger.warning(f"Tool get_etf_performance: Skipping fund due to missing code: {fund}")
             continue
-        
-        processed += 1
-        
         try:
-            # Use semaphore-controlled NAV request with timeout
-            pro = get_pro()
+            # Run blocking Tushare call in thread pool with timeout
             nav_df: DataFrame = await asyncio.wait_for(
-                get_fund_nav_with_semaphore(pro, code, start, end),
-                timeout=8.0
+                asyncio.to_thread(pro.fund_nav, ts_code=code, start_date=start, end_date=end),
+                timeout=10.0
             )
+            logger.debug(f"Tool get_etf_performance: fund_nav call for {code} successful.")
         except asyncio.TimeoutError:
+            logger.warning(f"Tool get_etf_performance: TuShare API request for {code} timed out.")
             results.append({"ts_code": code, "name": name, "error": "Request timed out"})
-            errors += 1
             continue
         except Exception as exc:
+            logger.error(f"Tool get_etf_performance: TuShare API error for {code}: {exc}")
             results.append({"ts_code": code, "name": name, "error": str(exc)})
-            errors += 1
             continue
         
         if nav_df.empty or len(nav_df.index) < 2:
-            skipped += 1
+            logger.info(f"Tool get_etf_performance: Skipping {code}: insufficient NAV data.")
             continue
         
-        # Identify price column
         price_col: Optional[str] = None
         for candidate in ["unit_nav", "nav", "per_nav", "accu_nav"]:
             if candidate in nav_df.columns:
-                price_col = candidate
-                break
+                # Ensure the column is not entirely NaN before selecting
+                if pd_isna is not None and not pd_isna(nav_df[candidate]).all():
+                    price_col = candidate
+                    break
         if price_col is None:
-            skipped += 1
+            logger.warning(f"Tool get_etf_performance: Skipping {code}: no valid price column found or all values are NaN.")
             continue
         
         start_price = nav_df.iloc[0][price_col]
@@ -468,12 +554,12 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
         try:
             start_float = float(start_price)
             end_float = float(end_price)
-        except Exception:
-            skipped += 1
+        except ValueError:
+            logger.warning(f"Tool get_etf_performance: Skipping {code}: invalid price value encountered (not floatable).")
             continue
         
         if start_float == 0:
-            skipped += 1
+            logger.warning(f"Tool get_etf_performance: Skipping {code}: start_price is zero.")
             continue
         
         change = (end_float - start_float) / start_float * 100
@@ -481,31 +567,34 @@ async def tool_etf_performance(*, start_date: str, end_date: str, market: str = 
             {
                 "ts_code": code,
                 "name": name,
-                "start_price": round(start_float, 4),
-                "end_price": round(end_float, 4),
+                "start_price": start_float,
+                "end_price": end_float,
                 "change_pct": round(change, 2),
             }
         )
+        logger.debug(f"Tool get_etf_performance: Calculated performance for {code}: {change:.2f}%")
         # Yield control to event loop
         await asyncio.sleep(0)
     
-    # Build response
+    # Add informative note
     elapsed_time = time.time() - start_time
     note = f"Returned {len(results)} ETFs"
-    note += f" (processed {processed}, skipped {skipped}, errors {errors})"
-    if total_funds > len(funds_to_process):
-        note += f". Limited from {total_funds} total ETFs to {limit} for performance"
-    if elapsed_time > max_total_duration - 5:
-        note += f" (stopped after {max_total_duration}s timeout)"
+    if len(results) < total_funds:
+        note += f" (limited from {total_funds} total ETFs to avoid timeout)"
+    if elapsed_time > max_duration:
+        note += f" (stopped after {max_duration:.1f}s timeout)"
     note += f". Processing time: {elapsed_time:.1f}s"
+    logger.info(f"etf_performance finished. {note}")
     
     response_text = json.dumps(results, ensure_ascii=False, indent=2)
     return {
         "content": [
             {"type": "text", "text": response_text},
-            {"type": "text", "text": f"Note: {note}"}
+            {"type": "text", "text": f"\n\nNote: {note}"}
         ]
     }
+
+
 async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, market: str = "E") -> dict:
     """
     获取指定时间周期内涨幅排行前 N 的 ETF
@@ -518,6 +607,7 @@ async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, mark
     Returns:
         MCP 格式的响应，包含涨幅排行前 N 的 ETF
     """
+    logger.info(f"Tool call: top_etfs_by_period with period: {period}, limit: {limit}, market: {market}")
     start_time = time.time()
     
     try:
@@ -530,15 +620,17 @@ async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, mark
             results = await _get_period_top_etfs(days=30, limit=limit, market=market)
             period_desc = "近一月"
         else:
+            logger.error(f"Tool top_etfs_by_period: Invalid period: {period}.")
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid period: {period}. Must be one of: week, month"
             )
         
         elapsed = time.time() - start_time
+        logger.info(f"Tool top_etfs_by_period finished. Elapsed time: {elapsed:.1f}s")
         
         # 格式化输出
-        output_lines = [f"{period_desc}涨幅前 {len(results)} 的 ETF：\n"]
+        output_lines = [f"{period_desc}涨幅前 {len(results)} 的 ETF：\n\n"]
         
         for i, etf in enumerate(results, 1):
             line = (
@@ -562,11 +654,13 @@ async def tool_top_etfs_by_period(*, period: str = "week", limit: int = 10, mark
         }
         
     except asyncio.TimeoutError:
+        logger.error(f"Tool top_etfs_by_period: Request timed out while fetching {period} ETF performance data.")
         raise HTTPException(
             status_code=504,
             detail=f"Request timed out while fetching {period} ETF performance data"
         )
     except Exception as exc:
+        logger.error(f"Tool top_etfs_by_period: Error fetching {period} ETF performance: {exc}")
         raise HTTPException(
             status_code=500,
             detail=f"Error fetching {period} ETF performance: {exc}"
@@ -584,35 +678,45 @@ def is_a_share_etf(code: str, name: str) -> bool:
     Returns:
         True if A股ETF, False otherwise
     """
+    # Defensive check for NaN or non-string inputs
+    if not isinstance(code, str) or not isinstance(name, str):
+        logger.debug(f"is_a_share_etf: Invalid input type - code: {type(code)}, name: {type(name)}")
+        return False
+        
     # 排除条件1: 代码以513开头的港股ETF
     if code.startswith('513'):
+        logger.debug(f"is_a_share_etf: Excluded {code} (Hong Kong ETF - 513 prefix).")
         return False
     
     # 排除条件2: 名称中包含港股相关关键词
     hk_keywords = ['港股', '香港', '恒生', '恒指', 'H股', 'HK', '港', '中概']
     if any(keyword in name for keyword in hk_keywords):
+        logger.debug(f"is_a_share_etf: Excluded {name} (Hong Kong keyword in name).")
         return False
     
     # 排除条件3: 美股、日本、欧洲等海外市场ETF
     overseas_keywords = ['美股', '纳斯达克', '标普', 'NASDAQ', 'S&P', '日本', '欧洲', '德国', '法国']
     if any(keyword in name for keyword in overseas_keywords):
+        logger.debug(f"is_a_share_etf: Excluded {name} (Overseas keyword in name).")
         return False
     
     # 保留条件: 上交所和深交所的主流A股ETF
     # 上交所: 51xxxx, 58xxxx (但513xxx是港股)
     # 深交所: 15xxxx, 16xxxx
     if code.startswith(('510', '511', '512', '515', '516', '518', '588', '150', '159', '160')):
+        logger.debug(f"is_a_share_etf: Included {code} (A-share prefix).")
         return True
     
     # 其他情况默认保留（谨慎起见）
+    logger.debug(f"is_a_share_etf: Included {code} (default - no specific exclusion/inclusion met).")
     return True
-
 
 
 async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
     """
     使用 Tushare 计算指定天数内的涨幅排行
     """
+    logger.info(f"Calling _get_period_top_etfs for {days} days, limit {limit}, market {market}")
     pro = get_pro()
     
     # 计算日期范围
@@ -621,28 +725,38 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
     
     start_date_str = start_date.strftime('%Y%m%d')
     end_date_str = end_date.strftime('%Y%m%d')
+    logger.info(f"Date range: {start_date_str} to {end_date_str}")
     
     try:
         # 1. 获取 ETF 列表
-        funds_df = await asyncio.wait_for(
+        funds_df: DataFrame = await asyncio.wait_for(
             asyncio.to_thread(pro.fund_basic, market=market),
             timeout=15.0
         )
+        logger.info(f"_get_period_top_etfs: fund_basic call successful, returned {len(funds_df)} funds.")
         
         if funds_df.empty:
+            logger.info("funds_df is empty, returning empty list.")
             return []
         
         # 2. 过滤掉港股ETF和海外ETF
+        # Ensure pd_isna is imported and used for NaN checks
+        if pd_isna is None:
+            logger.error("pandas isna function not available in _get_period_top_etfs.")
+            raise HTTPException(status_code=500, detail="pandas isna function not available.")
+            
         funds_filtered = funds_df[funds_df.apply(
             lambda row: is_a_share_etf(
-                str(row['ts_code'])[:6],  # 取前6位代码
-                str(row['name'])
+                str(row['ts_code']) if not pd_isna(row['ts_code']) else '', # Handle NaN
+                str(row['name']) if not pd_isna(row['name']) else '' # Handle NaN
             ), 
             axis=1
         )]
+        logger.info(f"After A-share filtering, {len(funds_filtered)} funds remaining.")
         
         # 3. 限制处理数量（处理 3 倍数量以确保有足够的有效数据）
         funds_to_process = funds_filtered.head(limit * 3)
+        logger.info(f"Processing top {len(funds_to_process)} funds to get desired limit of {limit}.")
         
         # 4. 计算每个 ETF 的涨幅
         results = []
@@ -651,10 +765,11 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
         for _, fund in funds_to_process.iterrows():
             # 整体超时保护
             if time.time() - overall_start > 50:
+                logger.warning("Overall timeout exceeded in _get_period_top_etfs, breaking loop.")
                 break
             
             try:
-                nav_df = await asyncio.wait_for(
+                nav_df: DataFrame = await asyncio.wait_for(
                     asyncio.to_thread(
                         pro.fund_nav,
                         ts_code=fund['ts_code'],
@@ -668,12 +783,18 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
                     # 按日期排序
                     nav_df_sorted = nav_df.sort_values(by='nav_date')
                     
+                    # Ensure 'unit_nav' column exists and is not entirely NaN
+                    if 'unit_nav' not in nav_df_sorted.columns or nav_df_sorted['unit_nav'].isnull().all():
+                        logger.warning(f"Skipping {fund['ts_code']}: 'unit_nav' column missing or all NaN.")
+                        continue # Skip if no valid NAV data
+                        
                     # 计算涨幅
                     start_nav = nav_df_sorted.iloc[0]['unit_nav']
                     end_nav = nav_df_sorted.iloc[-1]['unit_nav']
                     
-                    if start_nav and end_nav and start_nav > 0:
+                    if start_nav is not None and end_nav is not None and start_nav > 0: # Ensure not None
                         gain = (end_nav - start_nav) / start_nav * 100
+                        logger.debug(f"Calculated gain for {fund['ts_code']}: {gain:.2f}%")
                         
                         results.append({
                             'ts_code': fund['ts_code'],
@@ -682,24 +803,32 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
                             'start_nav': start_nav,
                             'end_nav': end_nav
                         })
+                    else:
+                        logger.warning(f"Skipping {fund['ts_code']}: start_nav or end_nav not valid or start_nav is zero ({start_nav}, {end_nav}).")
+                else:
+                    logger.info(f"Skipping {fund['ts_code']}: insufficient NAV data (empty or less than 2 rows).")
                 
             except asyncio.TimeoutError:
-                # 单个 ETF 超时，跳过继续处理下一个
+                logger.warning(f"Single ETF ({fund['ts_code']}) fund_nav request timed out, skipping.")
                 continue
-            except Exception:
-                # 其他错误也跳过
+            except Exception as e:
+                logger.error(f"Error processing ETF {fund['ts_code']}: {e}, skipping.")
                 continue
         
         # 4. 按涨幅降序排序并取前 N 个
         results_sorted = sorted(results, key=lambda x: x['gain'], reverse=True)
-        return results_sorted[:limit]
+        final_results = results_sorted[:limit]
+        logger.info(f"Finished processing, returning {len(final_results)} top ETFs.")
+        return final_results
         
     except asyncio.TimeoutError:
+        logger.error("_get_period_top_etfs: TuShare API request timed out while fetching ETF list.")
         raise HTTPException(
             status_code=504,
             detail=f"TuShare API request timed out while fetching ETF list"
         )
     except Exception as exc:
+        logger.error(f"_get_period_top_etfs: TuShare API error: {exc}")
         raise HTTPException(
             status_code=500,
             detail=f"TuShare API error: {exc}"
@@ -833,6 +962,7 @@ TOOLS: List[Tool] = [
 
 @app.get("/.well-known/mcp-config")
 async def mcp_config() -> dict:
+    logger.info("Received request for /.well-known/mcp-config")
     return {
         "transport": "streamable-http",
         "endpoint": "/mcp",
@@ -844,6 +974,7 @@ async def mcp_config() -> dict:
 
 @app.get("/health")
 async def health() -> dict:
+    logger.info("Received request for /health")
     return {"status": "healthy", "transport": "streamable-http"}
 
 @app.post("/mcp")
@@ -852,11 +983,14 @@ async def mcp_handler(request: Request):
     body = await request.json()
     method = body.get("method")
     request_id = body.get("id")
+    logger.info(f"Received MCP request: method={method}, id={request_id}")
 
     def reply(result: Optional[dict] = None, *, error: Optional[dict] = None) -> dict:
         if error:
+            logger.error(f"Replying with error for request {request_id}: {error}")
             return {"jsonrpc": "2.0", "error": error, "id": request_id}
         else:
+            logger.info(f"Replying with success for request {request_id}.")
             return {"jsonrpc": "2.0", "result": result, "id": request_id}
 
     # Generate response based on method
