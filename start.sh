@@ -1,7 +1,7 @@
 #!/bin/bash
-# Smithery MCP Server Startup Script for ETF MCP
+# ETF MCP Server Startup Script
 
-# 设置默认端口（Smithery 使用 8081）
+# 设置默认端口（默认 8081）
 export PORT=${PORT:-8081}
 
 echo "========================================="

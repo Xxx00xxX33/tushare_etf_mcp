@@ -396,9 +396,15 @@ class Tool:
         }
 
 
-async def tool_list_etfs(*, market: str = "E") -> dict:
-    """MCP tool: List all ETF funds."""
-    logger.info(f"Tool call: list_etfs with market: {market}")
+async def tool_list_etfs(*, market: str = "E", keyword: Optional[str] = None, limit: int = 50) -> dict:
+    """MCP tool: List ETF funds with optional keyword search.
+    
+    Args:
+        market: Market code (default 'E' for ETFs)
+        keyword: Optional keyword to search in ETF name or code
+        limit: Maximum number of results to return (default 50)
+    """
+    logger.info(f"Tool call: list_etfs with market: {market}, keyword: {keyword}, limit: {limit}")
     pro = get_pro()
     try:
         # Run blocking Tushare call in thread pool with timeout
@@ -414,13 +420,55 @@ async def tool_list_etfs(*, market: str = "E") -> dict:
         logger.error(f"Tool list_etfs: TuShare API error: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
+    # Filter by keyword if provided
+    if keyword:
+        keyword_lower = keyword.lower()
+        df = df[
+            df['name'].str.contains(keyword, case=False, na=False) | 
+            df['ts_code'].str.contains(keyword, case=False, na=False)
+        ]
+        logger.info(f"After keyword filter '{keyword}': {len(df)} rows")
+    
+    # Filter to A-share ETFs only
+    df = df[df.apply(
+        lambda row: is_a_share_etf(
+            str(row['ts_code'])[:6],
+            str(row['name'])
+        ),
+        axis=1
+    )]
+    logger.info(f"After A-share filter: {len(df)} rows")
+    
+    # Limit results
+    df = df.head(limit)
+    
     rows = df_to_dicts(df)
-    return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
+    
+    note = f"Found {len(rows)} ETF(s)"
+    if keyword:
+        note += f" matching keyword '{keyword}'"
+    if len(rows) >= limit:
+        note += f" (limited to {limit} results)"
+    
+    logger.info(f"Tool list_etfs: returning {len(rows)} results")
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)},
+            {"type": "text", "text": f"\n\n{note}"}
+        ]
+    }
 
 
-async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
-    """MCP tool: Get historical NAV data for an ETF."""
-    logger.info(f"Tool call: get_etf_history for {ts_code} from {start_date} to {end_date}")
+async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: int = 100) -> dict:
+    """MCP tool: Get historical NAV data for an ETF.
+    
+    Args:
+        ts_code: ETF code (e.g., '510050.SH')
+        start_date: Start date in YYYY-MM-DD or YYYYMMDD format (optional)
+        end_date: End date in YYYY-MM-DD or YYYYMMDD format (optional)
+        limit: Maximum number of records to return (default 100, most recent)
+    """
+    logger.info(f"Tool call: get_etf_history for {ts_code} from {start_date} to {end_date}, limit: {limit}")
     pro = get_pro()
 
     def normalise(value: Optional[str]) -> Optional[str]:
@@ -444,13 +492,41 @@ async def tool_etf_history(*, ts_code: str, start_date: Optional[str] = None, en
         logger.error(f"Tool get_etf_history for {ts_code}: TuShare API error: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
+    total_records = len(df)
+    
+    # Sort by date descending and limit results
+    if 'nav_date' in df.columns:
+        df = df.sort_values('nav_date', ascending=False)
+    elif 'end_date' in df.columns:
+        df = df.sort_values('end_date', ascending=False)
+    
+    df = df.head(limit)
+    
     rows = df_to_dicts(df)
-    return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
+    
+    note = f"Returned {len(rows)} record(s)"
+    if total_records > limit:
+        note += f" (limited from {total_records} total records, showing most recent)"
+    
+    logger.info(f"Tool get_etf_history: returning {len(rows)} results")
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)},
+            {"type": "text", "text": f"\n\n{note}"}
+        ]
+    }
 
 
-async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
-    """MCP tool: Get constituent holdings for an ETF."""
-    logger.info(f"Tool call: get_etf_holdings for {ts_code} from {start_date} to {end_date}")
+async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: int = 50) -> dict:
+    """MCP tool: Get constituent holdings for an ETF.
+    
+    Args:
+        ts_code: ETF code (e.g., '510050.SH')
+        start_date: Start date in YYYY-MM-DD or YYYYMMDD format (optional)
+        end_date: End date in YYYY-MM-DD or YYYYMMDD format (optional)
+        limit: Maximum number of holdings to return (default 50, top holdings by weight)
+    """
+    logger.info(f"Tool call: get_etf_holdings for {ts_code} from {start_date} to {end_date}, limit: {limit}")
     pro = get_pro()
 
     def normalise(value: Optional[str]) -> Optional[str]:
@@ -474,8 +550,29 @@ async def tool_etf_holdings(*, ts_code: str, start_date: Optional[str] = None, e
         logger.error(f"Tool get_etf_holdings for {ts_code}: TuShare API error: {exc}")
         raise HTTPException(status_code=500, detail=f"TuShare API error: {exc}")
     
+    total_holdings = len(df)
+    
+    # Sort by weight/proportion if available, then limit
+    if 'mkv' in df.columns:
+        df = df.sort_values('mkv', ascending=False)
+    elif 'per_nav' in df.columns:
+        df = df.sort_values('per_nav', ascending=False)
+    
+    df = df.head(limit)
+    
     rows = df_to_dicts(df)
-    return {"content": [{"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)}]}
+    
+    note = f"Returned {len(rows)} holding(s)"
+    if total_holdings > limit:
+        note += f" (limited from {total_holdings} total holdings, showing top holdings)"
+    
+    logger.info(f"Tool get_etf_holdings: returning {len(rows)} results")
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps(rows, ensure_ascii=False, indent=2)},
+            {"type": "text", "text": f"\n\n{note}"}
+        ]
+    }
 
 
 async def tool_etf_performance(*, start_date: str, end_date: str, market: str = "E", limit: int = 20) -> dict:
@@ -840,14 +937,23 @@ async def _get_period_top_etfs(days: int, limit: int, market: str) -> list:
 TOOLS: List[Tool] = [
     Tool(
         name="list_etfs",
-        description="List all ETF funds available on the Chinese A-share market.",
+        description="Search and list ETF funds on the Chinese A-share market. Use keyword parameter to search by name or code. Returns up to 50 results by default.",
         input_schema={
             "type": "object",
             "properties": {
                 "market": {
                     "type": "string",
-                    "description": "Market code to filter ETF types (default 'E')",
+                    "description": "Market code to filter ETF types (default 'E' for ETFs)",
                     "default": "E",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "Optional keyword to search in ETF name or code (e.g., '科技', '医药', '510')",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default 50)",
+                    "default": 50,
                 }
             },
             "required": [],
@@ -856,7 +962,7 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="get_etf_history",
-        description="Retrieve historical NAV (Net Asset Value) data for a specific ETF.",
+        description="Retrieve historical NAV (Net Asset Value) data for a specific ETF. Returns up to 100 most recent records by default.",
         input_schema={
             "type": "object",
             "properties": {
@@ -871,6 +977,11 @@ TOOLS: List[Tool] = [
                 "end_date": {
                     "type": "string",
                     "description": "End date in YYYY-MM-DD or YYYYMMDD format (optional)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of records to return (default 100, most recent)",
+                    "default": 100,
                 },
             },
             "required": ["ts_code"],
@@ -879,7 +990,7 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="get_etf_holdings",
-        description="Retrieve constituent holdings for a specific ETF.",
+        description="Retrieve constituent holdings for a specific ETF. Returns up to 50 top holdings by default.",
         input_schema={
             "type": "object",
             "properties": {
@@ -894,6 +1005,11 @@ TOOLS: List[Tool] = [
                 "end_date": {
                     "type": "string",
                     "description": "End date in YYYY-MM-DD or YYYYMMDD format (optional)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of holdings to return (default 50, top holdings by weight)",
+                    "default": 50,
                 },
             },
             "required": ["ts_code"],

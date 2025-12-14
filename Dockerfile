@@ -1,4 +1,4 @@
-# ETF MCP Server - Smithery Deployment
+# ETF MCP Server - Docker Deployment
 # Version: 1.1.0 - Force rebuild to ensure tushare is installed
 # Use an official Python runtime as the base image
 FROM python:3.11-slim
