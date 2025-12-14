@@ -1,4 +1,5 @@
 # ETF MCP Server - Smithery Deployment
+# Version: 1.1.0 - Force rebuild to ensure tushare is installed
 # Use an official Python runtime as the base image
 FROM python:3.11-slim
 
@@ -19,7 +20,8 @@ WORKDIR /app
 
 # Copy dependency file and install dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -c "import tushare; print(f'Tushare {tushare.__version__} installed successfully')"
 
 # Copy the rest of the application code
 COPY . .
