@@ -877,8 +877,10 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
         logger.info(f"After stock-type filtering: {len(funds_filtered)} ETFs")
         
         # 4. 限制处理数量（处理更多以确保有足够的有效数据）
-        funds_to_process = funds_filtered.head(limit * 10)
-        logger.info(f"Processing {len(funds_to_process)} ETFs to get top {limit}")
+        # 增加处理数量以覆盖更多 ETF，避免遗漏高涨幅 ETF
+        process_count = min(len(funds_filtered), max(200, limit * 50))
+        funds_to_process = funds_filtered.head(process_count)
+        logger.info(f"Processing {len(funds_to_process)} ETFs (from {len(funds_filtered)} filtered) to get top {limit}")
         
         # 5. 计算每个 ETF 在最近 N 个交易日的涨幅
         results = []
@@ -928,20 +930,30 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
                             'start_date': start_date_val,
                             'end_date': end_date_val
                         })
-                        logger.debug(f"{fund['ts_code']} {fund['name']}: {gain:.2f}%")
+                        logger.info(f"Calculated: {fund['ts_code']} {fund['name']}: {gain:.2f}%")
+                    else:
+                        logger.warning(f"Skipping {fund['ts_code']}: Invalid NAV data (start={start_nav}, end={end_nav})")
+                else:
+                    logger.warning(f"Skipping {fund['ts_code']}: Insufficient data ({len(nav_df)} records)")
                 
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout for {fund['ts_code']}, skipping")
+                logger.warning(f"Timeout for {fund['ts_code']} ({fund['name']}), skipping")
                 continue
             except Exception as e:
-                logger.warning(f"Error processing {fund['ts_code']}: {e}")
+                logger.warning(f"Error processing {fund['ts_code']} ({fund['name']}): {e}")
                 continue
         
         # 6. 按涨幅降序排序并取前 N 个
         results_sorted = sorted(results, key=lambda x: x['gain'], reverse=True)
         top_results = results_sorted[:limit]
         
-        logger.info(f"Returning top {len(top_results)} ETFs")
+        logger.info(f"Successfully calculated {len(results)} ETFs, returning top {len(top_results)}")
+        
+        # 记录前 10 名用于调试
+        logger.info("Top 10 ETFs by gain:")
+        for i, etf in enumerate(results_sorted[:10], 1):
+            logger.info(f"  {i}. {etf['ts_code']} {etf['name']}: {etf['gain']:.2f}%")
+        
         return top_results
         
     except asyncio.TimeoutError:
