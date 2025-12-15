@@ -796,7 +796,10 @@ def is_a_share_etf(code: str, name: str) -> bool:
 
 async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> list:
     """
-    获取最近 N 个交易日涨幅排行前 M 的 A 股股票型 ETF
+    获取最近 N 个交易日涨幅排行前 M 的 A 股股票型 ETF（两阶段优化版本）
+    
+    阶段 1：批量获取所有 ETF 净值并计算涨幅（快速扫描）
+    阶段 2：获取前 N 名的详细信息
     
     Args:
         trading_days: 交易日数量（例如 5）
@@ -805,27 +808,30 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
     Returns:
         涨幅排行列表
     """
-    logger.info(f"Calling _get_recent_trading_days_top_etfs for {trading_days} trading days, limit {limit}")
+    logger.info(f"Calling _get_recent_trading_days_top_etfs (Two-stage) for {trading_days} trading days, limit {limit}")
     pro = get_pro()
     
     try:
-        # 1. 获取交易日历，找到最近 N 个交易日
-        # 获取最近 30 天的交易日历（确保能覆盖到足够的交易日）
+        # ===== 阶段 1：批量获取净值并计算涨幅 =====
+        
+        # 1.1 获取交易日历
         end_date = datetime.now()
         start_date = end_date - timedelta(days=30)
         
         start_date_str = start_date.strftime('%Y%m%d')
         end_date_str = end_date.strftime('%Y%m%d')
         
-        # 获取交易日历
         trade_cal_df: DataFrame = await asyncio.wait_for(
             asyncio.to_thread(pro.trade_cal, exchange='SSE', start_date=start_date_str, end_date=end_date_str),
             timeout=10.0
         )
         logger.info(f"Trade calendar retrieved: {len(trade_cal_df)} days")
         
-        # 筛选出交易日（is_open=1）
         trading_days_df = trade_cal_df[trade_cal_df['is_open'] == 1].sort_values('cal_date', ascending=False)
+        
+        # 排除今天（今天的净值数据可能还没有更新）
+        today_str = datetime.now().strftime('%Y%m%d')
+        trading_days_df = trading_days_df[trading_days_df['cal_date'] < today_str]
         
         if len(trading_days_df) < trading_days:
             logger.warning(f"Not enough trading days found: {len(trading_days_df)} < {trading_days}")
@@ -834,14 +840,13 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
                 detail=f"Not enough trading days found: {len(trading_days_df)} < {trading_days}"
             )
         
-        # 获取最近 N 个交易日
         recent_trading_days = trading_days_df.head(trading_days)
         latest_trading_day = recent_trading_days.iloc[0]['cal_date']
         earliest_trading_day = recent_trading_days.iloc[-1]['cal_date']
         
         logger.info(f"Recent {trading_days} trading days: {earliest_trading_day} to {latest_trading_day}")
         
-        # 2. 获取 A 股股票型 ETF 列表
+        # 1.2 获取 A 股股票型 ETF 列表
         funds_df: DataFrame = await asyncio.wait_for(
             asyncio.to_thread(pro.fund_basic, market='E'),
             timeout=15.0
@@ -852,12 +857,11 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
             logger.info("funds_df is empty, returning empty list")
             return []
         
-        # 3. 过滤 A 股股票型 ETF
+        # 1.3 过滤 A 股股票型 ETF
         if pd_isna is None:
             logger.error("pandas isna function not available")
             raise HTTPException(status_code=500, detail="pandas isna function not available")
         
-        # 先过滤 A 股 ETF
         funds_filtered = funds_df[funds_df.apply(
             lambda row: is_a_share_etf(
                 str(row['ts_code']) if not pd_isna(row['ts_code']) else '',
@@ -867,7 +871,6 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
         )]
         logger.info(f"After A-share filtering: {len(funds_filtered)} ETFs")
         
-        # 再过滤股票型 ETF
         funds_filtered = funds_filtered[funds_filtered.apply(
             lambda row: is_stock_etf(
                 str(row['name']) if not pd_isna(row['name']) else ''
@@ -876,84 +879,93 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
         )]
         logger.info(f"After stock-type filtering: {len(funds_filtered)} ETFs")
         
-        # 4. 限制处理数量（处理更多以确保有足够的有效数据）
-        # 增加处理数量以覆盖更多 ETF，避免遗漏高涨幅 ETF
-        process_count = min(len(funds_filtered), max(200, limit * 50))
-        funds_to_process = funds_filtered.head(process_count)
-        logger.info(f"Processing {len(funds_to_process)} ETFs (from {len(funds_filtered)} filtered) to get top {limit}")
+        # 1.4 批量获取所有 ETF 的净值（关键优化点）
+        logger.info(f"Batch fetching NAV for {len(funds_filtered)} ETFs...")
         
-        # 5. 计算每个 ETF 在最近 N 个交易日的涨幅
+        # 获取最新净值（使用 nav_date 参数）
+        latest_nav_df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(
+                pro.fund_nav,
+                nav_date=latest_trading_day
+            ),
+            timeout=30.0
+        )
+        logger.info(f"Latest NAV retrieved: {len(latest_nav_df)} records")
+        
+        # 获取起始净值（使用 nav_date 参数）
+        earliest_nav_df: DataFrame = await asyncio.wait_for(
+            asyncio.to_thread(
+                pro.fund_nav,
+                nav_date=earliest_trading_day
+            ),
+            timeout=30.0
+        )
+        logger.info(f"Earliest NAV retrieved: {len(earliest_nav_df)} records")
+        
+        # 1.5 构建净值字典
+        latest_nav_dict = {}
+        if not latest_nav_df.empty:
+            for _, row in latest_nav_df.iterrows():
+                ts_code = row['ts_code']
+                unit_nav = row.get('unit_nav')
+                nav_date = row.get('nav_date')
+                if unit_nav is not None and not pd_isna(unit_nav):
+                    latest_nav_dict[ts_code] = {'nav': float(unit_nav), 'date': nav_date}
+        
+        earliest_nav_dict = {}
+        if not earliest_nav_df.empty:
+            for _, row in earliest_nav_df.iterrows():
+                ts_code = row['ts_code']
+                unit_nav = row.get('unit_nav')
+                nav_date = row.get('nav_date')
+                if unit_nav is not None and not pd_isna(unit_nav):
+                    earliest_nav_dict[ts_code] = {'nav': float(unit_nav), 'date': nav_date}
+        
+        logger.info(f"NAV dict built: {len(latest_nav_dict)} latest, {len(earliest_nav_dict)} earliest")
+        
+        # 1.6 计算所有 ETF 的涨幅
         results = []
-        overall_start = time.time()
-        
-        for _, fund in funds_to_process.iterrows():
-            # 整体超时保护
-            if time.time() - overall_start > 50:
-                logger.warning("Overall timeout exceeded, breaking loop")
-                break
+        for _, fund in funds_filtered.iterrows():
+            ts_code = fund['ts_code']
+            name = fund['name']
             
-            try:
-                nav_df: DataFrame = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        pro.fund_nav,
-                        ts_code=fund['ts_code'],
-                        start_date=earliest_trading_day,
-                        end_date=latest_trading_day
-                    ),
-                    timeout=10.0
-                )
+            # 检查是否有起始和结束净值
+            if ts_code in latest_nav_dict and ts_code in earliest_nav_dict:
+                start_nav = earliest_nav_dict[ts_code]['nav']
+                end_nav = latest_nav_dict[ts_code]['nav']
+                start_date_val = earliest_nav_dict[ts_code]['date']
+                end_date_val = latest_nav_dict[ts_code]['date']
                 
-                if not nav_df.empty and len(nav_df) >= 2:
-                    # 按日期排序
-                    nav_df_sorted = nav_df.sort_values(by='nav_date')
+                if start_nav > 0:
+                    gain = (end_nav - start_nav) / start_nav * 100
                     
-                    # 检查 unit_nav 列
-                    if 'unit_nav' not in nav_df_sorted.columns or nav_df_sorted['unit_nav'].isnull().all():
-                        logger.warning(f"Skipping {fund['ts_code']}: 'unit_nav' column missing or all NaN")
-                        continue
-                    
-                    # 获取起始和结束净值
-                    start_nav = nav_df_sorted.iloc[0]['unit_nav']
-                    end_nav = nav_df_sorted.iloc[-1]['unit_nav']
-                    start_date_val = nav_df_sorted.iloc[0]['nav_date']
-                    end_date_val = nav_df_sorted.iloc[-1]['nav_date']
-                    
-                    if start_nav is not None and end_nav is not None and start_nav > 0:
-                        gain = (end_nav - start_nav) / start_nav * 100
-                        
-                        results.append({
-                            'ts_code': fund['ts_code'],
-                            'name': fund['name'],
-                            'gain': gain,
-                            'start_nav': start_nav,
-                            'end_nav': end_nav,
-                            'start_date': start_date_val,
-                            'end_date': end_date_val
-                        })
-                        logger.info(f"Calculated: {fund['ts_code']} {fund['name']}: {gain:.2f}%")
-                    else:
-                        logger.warning(f"Skipping {fund['ts_code']}: Invalid NAV data (start={start_nav}, end={end_nav})")
-                else:
-                    logger.warning(f"Skipping {fund['ts_code']}: Insufficient data ({len(nav_df)} records)")
-                
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout for {fund['ts_code']} ({fund['name']}), skipping")
-                continue
-            except Exception as e:
-                logger.warning(f"Error processing {fund['ts_code']} ({fund['name']}): {e}")
-                continue
+                    results.append({
+                        'ts_code': ts_code,
+                        'name': name,
+                        'gain': gain,
+                        'start_nav': start_nav,
+                        'end_nav': end_nav,
+                        'start_date': start_date_val,
+                        'end_date': end_date_val
+                    })
         
-        # 6. 按涨幅降序排序并取前 N 个
+        logger.info(f"Successfully calculated {len(results)} ETFs from {len(funds_filtered)} filtered")
+        
+        # 1.7 排序并取前 N 个
         results_sorted = sorted(results, key=lambda x: x['gain'], reverse=True)
-        top_results = results_sorted[:limit]
-        
-        logger.info(f"Successfully calculated {len(results)} ETFs, returning top {len(top_results)}")
         
         # 记录前 10 名用于调试
         logger.info("Top 10 ETFs by gain:")
         for i, etf in enumerate(results_sorted[:10], 1):
             logger.info(f"  {i}. {etf['ts_code']} {etf['name']}: {etf['gain']:.2f}%")
         
+        top_results = results_sorted[:limit]
+        
+        # ===== 阶段 2：获取详细信息（可选，当前已有足够信息）=====
+        # 如果需要更详细的历史数据，可以在这里对 top_results 进行额外查询
+        # 当前实现中，阶段 1 已经提供了所有必要信息
+        
+        logger.info(f"Returning top {len(top_results)} ETFs")
         return top_results
         
     except asyncio.TimeoutError:
@@ -964,6 +976,8 @@ async def _get_recent_trading_days_top_etfs(trading_days: int, limit: int) -> li
         )
     except Exception as exc:
         logger.error(f"Error in _get_recent_trading_days_top_etfs: {exc}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500,
             detail=f"TuShare API error: {exc}"
