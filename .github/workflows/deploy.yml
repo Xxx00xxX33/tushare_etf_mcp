@@ -12,6 +12,11 @@ permissions:
 env:
   # GHCR image must be lowercase
   GHCR_IMAGE: ghcr.io/xxx00xxx33/tushare_etf_mcp
+  APP_DIR: /opt/tushare_etf_mcp
+  COMPOSE_MAIN: /opt/tushare_etf_mcp/compose.yml
+  COMPOSE_OVERRIDE: /opt/tushare_etf_mcp/compose.ghcr.override.yml
+  CONTAINER_NAME: mcp_tushare_etf_mcp
+  HEALTH_URL: http://127.0.0.1:8830/health
 
 jobs:
   build:
@@ -50,21 +55,63 @@ jobs:
   deploy:
     needs: build
     runs-on: [self-hosted, alphavps]
+    timeout-minutes: 15
     steps:
       - name: Deploy on AlphaVPS
         env:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
         run: |
           set -euo pipefail
-          cd /opt/tushare_etf_mcp
 
+          echo "[0/7] Preconditions"
+          test -f "${COMPOSE_MAIN}"
+          test -f "${COMPOSE_OVERRIDE}"
+
+          echo "[1/7] Pull image tag: ${IMAGE_TAG}"
           export IMAGE_TAG="${IMAGE_TAG}"
+          docker compose -f "${COMPOSE_MAIN}" -f "${COMPOSE_OVERRIDE}" pull
 
-          docker compose -f /opt/tushare_etf_mcp/compose.yml -f /opt/tushare_etf_mcp/compose.ghcr.override.yml pull
-          docker compose -f /opt/tushare_etf_mcp/compose.yml -f /opt/tushare_etf_mcp/compose.ghcr.override.yml up -d --no-build --force-recreate --remove-orphans
+          echo "[2/7] Recreate container (NO build on VPS)"
+          docker compose -f "${COMPOSE_MAIN}" -f "${COMPOSE_OVERRIDE}" up -d --no-build --force-recreate --remove-orphans
 
-          status_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8830/health || true)
-          test "${status_code}" = "200"
+          echo "[3/7] Compose status"
+          docker compose -f "${COMPOSE_MAIN}" -f "${COMPOSE_OVERRIDE}" ps
 
-          docker compose -f /opt/tushare_etf_mcp/compose.yml -f /opt/tushare_etf_mcp/compose.ghcr.override.yml ps
+          echo "[4/7] Health check (retry up to 60s)"
+          ok=0
+          for i in $(seq 1 30); do
+            # Prefer Docker HEALTHCHECK status if defined, otherwise fall back to HTTP
+            hs="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealth{{end}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
+            if [ "$hs" = "healthy" ]; then
+              ok=1
+              break
+            fi
+
+            code="$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}" || true)"
+            if [ "$code" = "200" ]; then
+              ok=1
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "ERROR: Health check failed."
+            echo "--- docker inspect (State) ---"
+            docker inspect "${CONTAINER_NAME}" --format 'Image={{.Config.Image}} Status={{.State.Status}} Health={{if .State.Health}}{{.State.Health.Status}}{{else}}nohealth{{end}} StartedAt={{.State.StartedAt}}' || true
+            echo "--- last 200 container logs ---"
+            docker logs --tail 200 "${CONTAINER_NAME}" || true
+            echo "--- curl -i health ---"
+            curl -i --max-time 3 "${HEALTH_URL}" || true
+            exit 1
+          fi
+
+          echo "[5/7] Confirm running image"
+          docker inspect -f 'Config.Image={{.Config.Image}} StartedAt={{.State.StartedAt}}' "${CONTAINER_NAME}"
+
+          echo "[6/7] Final status"
+          docker compose -f "${COMPOSE_MAIN}" -f "${COMPOSE_OVERRIDE}" ps
+
+          echo "[7/7] Cleanup"
           docker image prune -f
